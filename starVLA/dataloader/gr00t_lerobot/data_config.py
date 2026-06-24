@@ -782,6 +782,101 @@ class SingleFrankaRobotiqDeltaJointsDataConfig:
 ###########################################################################################
 
 
+@dataclass
+class SonicLatentDataConfig:
+    """SonicStar (Unitree G1) humanoid latent-action dataset.
+
+    Inputs : ego_view video + observation.state(43) + projected_gravity(3) + language
+    Outputs: action.motion_token(64) + left_hand_joints(7) + right_hand_joints(7) = 78-dim
+    """
+
+    video_keys = [
+        "video.ego_view",
+    ]
+    state_keys = [
+        "state.left_leg",
+        "state.right_leg",
+        "state.waist",
+        "state.left_arm",
+        "state.left_hand",
+        "state.right_arm",
+        "state.right_hand",
+        "state.projected_gravity",
+    ]
+    action_keys = [
+        "action.motion_token",
+        "action.left_hand_joints",
+        "action.right_hand_joints",
+    ]
+    language_keys = ["annotation.human.task_description"]
+
+    def __init__(self, observation_indices, action_indices):
+        # observation_indices == range(video_horizon) == range(vj2.num_frames) for the world model.
+        self.observation_indices = observation_indices
+        self.action_indices = action_indices
+        # State is read as a single current frame.
+        self.state_indices = [0]
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=[0],
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            # state transforms
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.left_leg": "min_max",
+                    "state.right_leg": "min_max",
+                    "state.waist": "min_max",
+                    "state.left_arm": "min_max",
+                    "state.left_hand": "min_max",
+                    "state.right_arm": "min_max",
+                    "state.right_hand": "min_max",
+                    "state.projected_gravity": "min_max",
+                },
+            ),
+            # action transforms
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.motion_token": "min_max",
+                    "action.left_hand_joints": "min_max",
+                    "action.right_hand_joints": "min_max",
+                },
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+
+###########################################################################################
+
+
 
 ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig,
@@ -790,6 +885,7 @@ ROBOT_TYPE_CONFIG_MAP = {
     #"oxe_droid": OxeDroidDataConfig(),
     "oxe_bridge": OxeBridgeDataConfig,
     "oxe_rt1": OxeRT1DataConfig,
+    "sonic_latent_humanoid": SonicLatentDataConfig,
     #"demo_sim_franka_delta_joints": SingleFrankaRobotiqDeltaJointsDataConfig(),
     #"custom_robot_config": SingleFrankaRobotiqDeltaEefDataConfig()
 }

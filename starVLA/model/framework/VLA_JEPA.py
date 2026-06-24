@@ -78,8 +78,24 @@ class VLA_JEPA(baseframework):
         self.past_action_window_size = config.framework.action_model.past_action_window_size
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
         
-        self.vj_encoder = AutoModel.from_pretrained(self.config.framework.vj2_model.base_encoder)
-        self.vj_processor = AutoVideoProcessor.from_pretrained(self.config.framework.vj2_model.base_encoder)
+        base_encoder = self.config.framework.vj2_model.base_encoder
+        if str(base_encoder).endswith(".pt"):
+            # V-JEPA 2.1: Meta raw checkpoint loaded via the vendored encoder adapter
+            # (the installed transformers does not support the 2.1 architecture).
+            from starVLA.model.modules.world_model.vjepa21_encoder import (
+                load_vjepa21_encoder,
+                build_vjepa21_processor,
+            )
+            vj21_img_size = self.config.framework.vj2_model.get("image_size", 384)
+            self.vj_encoder = load_vjepa21_encoder(
+                checkpoint_path=base_encoder,
+                arch=self.config.framework.vj2_model.get("arch", "vit_large"),
+                img_size=vj21_img_size,
+            )
+            self.vj_processor = build_vjepa21_processor(img_size=vj21_img_size)
+        else:
+            self.vj_encoder = AutoModel.from_pretrained(base_encoder)
+            self.vj_processor = AutoVideoProcessor.from_pretrained(base_encoder)
 
         tubelet_size = self.vj_encoder.config.tubelet_size
         self.vj_predictor = VisionTransformerPredictorAC(

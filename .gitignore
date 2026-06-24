@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Training / data artifacts (large; keep out of git)
+checkpoints/
+data/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp

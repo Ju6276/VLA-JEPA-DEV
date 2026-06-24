@@ -184,7 +184,7 @@ class VLATrainer(TrainerUtils):
             # self.vlm_train_dataloader
         )
 
-        #self._init_wandb()
+        self._init_wandb()
         self._init_checkpointing()
 
     def _calculate_total_batch_size(self):
@@ -253,7 +253,7 @@ class VLATrainer(TrainerUtils):
                 metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
 
                 # record to W&B
-                #wandb.log(metrics, step=self.completed_steps)
+                wandb.log(metrics, step=self.completed_steps)
                 # debug output
                 logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
@@ -509,8 +509,8 @@ class VLATrainer(TrainerUtils):
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
         # close W&B
-        #if self.accelerator.is_main_process:
-        #    wandb.finish()
+        if self.accelerator.is_main_process:
+            wandb.finish()
 
         self.accelerator.wait_for_everyone()
 

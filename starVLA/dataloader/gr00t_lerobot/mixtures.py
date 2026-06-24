@@ -69,5 +69,10 @@ DATASET_NAMED_MIXTURES = {
         ("BEHAVIOR_challenge", 1.0, "R1Pro"),
     ],
 
+    # SonicStar (Unitree G1) humanoid latent-action dataset (Tang-keke/merged_dataset_001)
+    "sonic_merged_dataset_001": [
+        ("merged_dataset_001", 1.0, "sonic_latent_humanoid"),
+    ],
+
 
 }
