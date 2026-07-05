@@ -324,14 +324,23 @@ class LeRobotSingleDataset(Dataset):
             le_video_meta = le_info["features"][original_key]
             height = le_video_meta["shape"][le_video_meta["names"].index("height")]
             width = le_video_meta["shape"][le_video_meta["names"].index("width")]
-            # NOTE(FH): different lerobot dataset versions have different keys for the number of channels and fps
+            # NOTE(FH): different lerobot dataset versions have different keys for channels and fps
+            names = le_video_meta["names"]
+            feature_info = le_video_meta.get("info") or le_video_meta.get("video_info") or {}
             try:
-                channels = le_video_meta["shape"][le_video_meta["names"].index("channel")]
-                fps = le_video_meta["video_info"]["video.fps"]
+                channel_key = "channel" if "channel" in names else "channels"
+                channels = le_video_meta["shape"][names.index(channel_key)]
             except (ValueError, KeyError):
-                # channels = le_video_meta["shape"][le_video_meta["names"].index("channels")]
-                channels = le_video_meta["info"]["video.channels"]
-                fps = le_video_meta["info"]["video.fps"]
+                channels = feature_info.get("video.channels")
+                if channels is None:
+                    channels = le_video_meta["shape"][-1]
+            fps = feature_info.get("video.fps")
+            if fps is None:
+                fps = le_info.get("fps")
+            if fps is None:
+                raise KeyError(
+                    f"Could not determine video fps for feature '{original_key}' in {le_info_path}"
+                )
             simplified_modality_meta["video"][new_key] = {
                 "resolution": [width, height],
                 "channels": channels,
@@ -357,10 +366,16 @@ class LeRobotSingleDataset(Dataset):
         for our_modality in ["state", "action"]:
             dataset_statistics[our_modality] = {}
             for subkey in simplified_modality_meta[our_modality]:
-                dataset_statistics[our_modality][subkey] = {}
                 state_action_meta = le_modality_meta.get_key_meta(f"{our_modality}.{subkey}")
                 assert isinstance(state_action_meta, LeRobotStateActionMetadata)
                 le_modality = state_action_meta.original_key
+                if le_modality not in le_statistics:
+                    print(
+                        f"Skipping statistics for {our_modality}.{subkey}: "
+                        f"'{le_modality}' not found in {stats_path}"
+                    )
+                    continue
+                dataset_statistics[our_modality][subkey] = {}
                 for stat_name in le_statistics[le_modality]:
                     indices = np.arange(
                         state_action_meta.start,
@@ -1379,6 +1394,7 @@ class LeRobotMixtureDataset(Dataset):
         with_state: bool = False,
         resolution_size: int = 224,
         video_resolution_size: int = 256,
+        duplicate_single_view: bool = True,
         seed: int = 42,
         metadata_config: dict = {
             "percentile_mixing_method": "min_max",
@@ -1415,6 +1431,7 @@ class LeRobotMixtureDataset(Dataset):
         self.with_state = with_state
         self.resolution_size = resolution_size
         self.video_resolution_size = video_resolution_size
+        self.duplicate_single_view = duplicate_single_view
 
         # Set properties for sampling
 
@@ -1604,8 +1621,8 @@ class LeRobotMixtureDataset(Dataset):
                         videos.append(video)
                     primary_image = Image.fromarray(video[0]).resize((self.resolution_size, self.resolution_size))
                     images.append(primary_image)
-                if len(dataset.modality_keys["video"]) == 1:
-                    videos = [videos[0], videos[0].copy()]  # Duplicate if only one video
+                if len(dataset.modality_keys["video"]) == 1 and self.duplicate_single_view:
+                    videos = [videos[0], videos[0].copy()]
                 videos = np.stack(videos, axis=0)  # Shape: (V, T, H, W, C)        
                     
                 # Get language and action data

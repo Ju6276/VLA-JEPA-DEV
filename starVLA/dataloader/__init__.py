@@ -44,14 +44,19 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         vla_dataset = get_vla_dataset(
             data_cfg=vla_dataset_cfg,
             action_horizon=cfg.framework.action_model.action_horizon,
-            video_horizon=cfg.framework.vj2_model.num_frames)
+            video_horizon=cfg.framework.vj2_model.num_frames,
+            delete_pause_frame=vla_dataset_cfg.get("delete_pause_frame", False))
         
+        num_workers = cfg.datasets.vla_data.get("num_workers", 8)
+        prefetch_factor = cfg.datasets.vla_data.get("prefetch_factor", 2) if num_workers > 0 else None
         vla_train_dataloader = DataLoader(
             vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=collate_fn,
-            num_workers=8,
-            # shuffle=True
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=prefetch_factor,
         )        
         if dist.get_rank() == 0: 
             

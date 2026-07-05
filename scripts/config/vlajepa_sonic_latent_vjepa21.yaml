@@ -68,6 +68,7 @@ framework:
     base_encoder: /dev/shm/models/vjepa2_1_vitl_dist_vitG_384.pt
     arch: vit_large
     image_size: 384
+    num_video_views: 1
     depth: 12
     num_heads: 8
     special_action_token: <|action_{}|>
@@ -90,6 +91,9 @@ datasets:
     video_resolution_size: 384   # V-JEPA 2.1 ViT-L final checkpoint is 384px (was 256)
     load_all_data_for_training: true
     with_state: true
+    duplicate_single_view: false   # single ego_view: don't duplicate, avoid running V-JEPA encoder twice
+    num_workers: 16
+    prefetch_factor: 4
 
 
 trainer:

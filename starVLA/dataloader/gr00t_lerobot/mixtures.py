@@ -74,5 +74,17 @@ DATASET_NAMED_MIXTURES = {
         ("merged_dataset_001", 1.0, "sonic_latent_humanoid"),
     ],
 
+    # Sonic garbage-bin task (all_merged)
+    "garbage": [
+        ("all_merged", 1.0, "garbage"),
+    ],
+
+    "g1_handover": [
+        ("dataset/G1WholebodyHandoverTeleop-v0", 1.0, "g1_handover"),
+    ],
+
+    "g1_pick_between_tables": [
+        ("dataset/G1WholebodyLocomotionPickBetweenTablesTeleop-v0", 1.0, "g1_pick_between_tables"),
+    ],
 
 }

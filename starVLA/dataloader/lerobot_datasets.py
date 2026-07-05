@@ -45,7 +45,8 @@ def make_LeRobotSingleDataset(
         modality_configs=modality_config,
         transforms=transforms,
         embodiment_tag=embodiment_tag,
-        video_backend="torchvision_av",
+        video_backend="decord",
+        video_backend_kwargs={"num_threads": 1},
         delete_pause_frame=delete_pause_frame,
     )
 
@@ -93,6 +94,7 @@ def get_vla_dataset(
         with_state=data_cfg.get("with_state", False),
         resolution_size=data_cfg.get("resolution_size", 224),
         video_resolution_size=data_cfg.get("video_resolution_size", 256),
+        duplicate_single_view=data_cfg.get("duplicate_single_view", True),
         seed=seed,
         **kwargs,
     )

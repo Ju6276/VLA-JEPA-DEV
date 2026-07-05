@@ -98,13 +98,14 @@ class VLA_JEPA(baseframework):
             self.vj_processor = AutoVideoProcessor.from_pretrained(base_encoder)
 
         tubelet_size = self.vj_encoder.config.tubelet_size
+        self.num_video_views = self.config.framework.vj2_model.get("num_video_views", 2)
         self.vj_predictor = VisionTransformerPredictorAC(
             num_frames=self.config.framework.vj2_model.num_frames//tubelet_size,
             img_size=((self.vj_encoder.config.image_size, self.vj_encoder.config.image_size)),
             tubelet_size=1,
             depth=self.config.framework.vj2_model.depth,
             num_heads=self.config.framework.vj2_model.num_heads,
-            embed_dim=self.vj_encoder.config.hidden_size * 2, # multi view
+            embed_dim=self.vj_encoder.config.hidden_size * self.num_video_views,
             action_embed_dim=self.qwen_vl_interface.model.config.hidden_size,
             num_add_tokens=self.config.framework.vj2_model.num_action_tokens_per_timestep,
         )
@@ -231,12 +232,9 @@ class VLA_JEPA(baseframework):
             # Step 2: JEPA Encoder
             B, V, T, C, H, W = batch_videos.shape
             batch_videos = batch_videos.reshape(B*V, T, C, H, W)  # [B*V, T, C, H, W]
-            input_videos = []
-            for i in range(B*V):
-                input_videos.append(self.vj_processor(
-                    videos=batch_videos[i], return_tensors="pt"
-                )["pixel_values_videos"].to(self.vj_encoder.device))
-            input_videos = torch.cat(input_videos, dim=0)  # [B*V, T, C, H, W]
+            input_videos = self.vj_processor(
+                videos=[batch_videos[i] for i in range(B*V)], return_tensors="pt"
+            )["pixel_values_videos"].to(self.vj_encoder.device)  # [B*V, T, C, H, W]
             with torch.no_grad():
                 video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
                 video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=V, dim=0), dim=2)

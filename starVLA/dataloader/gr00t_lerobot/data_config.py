@@ -877,6 +877,199 @@ class SonicLatentDataConfig:
 ###########################################################################################
 
 
+@dataclass
+class GarbageDataConfig:
+    """Data config for Sonic garbage-bin task (all_merged dataset).
+
+    Action: 78D = motion_token(64) + left_hand_joints(7) + right_hand_joints(7)
+    State: 46D = body joints(43) + projected_gravity(3)
+    Video: ego_view only (single camera)
+    """
+
+    video_keys = [
+        "video.ego_view",
+    ]
+    state_keys = [
+        "state.left_leg",
+        "state.right_leg",
+        "state.waist",
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+        "state.projected_gravity",
+    ]
+    action_keys = [
+        "action.motion_token",
+        "action.left_hand_joints",
+        "action.right_hand_joints",
+    ]
+
+    language_keys = ["annotation.human.task_description"]
+
+    def __init__(self, observation_indices, action_indices):
+        self.observation_indices = observation_indices
+        self.action_indices = action_indices
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.left_leg": "min_max",
+                    "state.right_leg": "min_max",
+                    "state.waist": "min_max",
+                    "state.left_arm": "min_max",
+                    "state.right_arm": "min_max",
+                    "state.left_hand": "min_max",
+                    "state.right_hand": "min_max",
+                    "state.projected_gravity": "min_max",
+                },
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.motion_token": "min_max",
+                    "action.left_hand_joints": "min_max",
+                    "action.right_hand_joints": "min_max",
+                },
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+
+###########################################################################################
+
+
+@dataclass
+class G1HandoverDataConfig:
+    """Data config for G1 Wholebody Handover Teleop dataset.
+
+    Action: 36D = left_hand(7) + right_hand(7) + left_arm(7) + right_arm(7) +
+            rpy(3) + height(1) + torso_vx(1) + torso_vy(1) + torso_vyaw(1) + target_yaw(1)
+    State: 32D = left_hand(7) + right_hand(7) + left_arm(7) + right_arm(7) + rpy(3) + height(1)
+    """
+
+    video_keys = [
+        "video.rs_view",
+    ]
+    state_keys = [
+        "state.left_hand",
+        "state.right_hand",
+        "state.left_arm",
+        "state.right_arm",
+        "state.rpy",
+        "state.height",
+    ]
+    action_keys = [
+        "action.left_hand",
+        "action.right_hand",
+        "action.left_arm",
+        "action.right_arm",
+        "action.rpy",
+        "action.height",
+        "action.torso_vx",
+        "action.torso_vy",
+        "action.torso_vyaw",
+        "action.target_yaw",
+    ]
+
+    language_keys = ["annotation.human.task_description"]
+
+    def __init__(self, observation_indices, action_indices):
+        self.observation_indices = observation_indices
+        self.action_indices = action_indices
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.left_hand": "min_max",
+                    "state.right_hand": "min_max",
+                    "state.left_arm": "min_max",
+                    "state.right_arm": "min_max",
+                    "state.rpy": "min_max",
+                    "state.height": "min_max",
+                },
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.left_hand": "min_max",
+                    "action.right_hand": "min_max",
+                    "action.left_arm": "min_max",
+                    "action.right_arm": "min_max",
+                    "action.rpy": "min_max",
+                    "action.height": "min_max",
+                    "action.torso_vx": "mean_std",
+                    "action.torso_vy": "mean_std",
+                    "action.torso_vyaw": "mean_std",
+                    "action.target_yaw": "mean_std",
+                },
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+
+###########################################################################################
+
 
 ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig,
@@ -886,6 +1079,9 @@ ROBOT_TYPE_CONFIG_MAP = {
     "oxe_bridge": OxeBridgeDataConfig,
     "oxe_rt1": OxeRT1DataConfig,
     "sonic_latent_humanoid": SonicLatentDataConfig,
+    "garbage": GarbageDataConfig,
+    "g1_handover": G1HandoverDataConfig,
+    "g1_pick_between_tables": G1HandoverDataConfig,
     #"demo_sim_franka_delta_joints": SingleFrankaRobotiqDeltaJointsDataConfig(),
     #"custom_robot_config": SingleFrankaRobotiqDeltaEefDataConfig()
 }

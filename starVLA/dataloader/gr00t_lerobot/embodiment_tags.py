@@ -52,6 +52,26 @@ class EmbodimentTag(Enum):
     The Franka Emika Panda robot.
     """
 
+    SONIC_HUMANOID = "sonic_humanoid"
+    """
+    The NVIDIA Sonic humanoid robot.
+    """
+
+    G1_HANDOVER = "g1_handover"
+    """
+    The G1 wholebody handover teleop dataset.
+    """
+
+    G1_PICK_BETWEEN_TABLES = "g1_pick_between_tables"
+    """
+    The G1 wholebody locomotion pick between tables teleop dataset.
+    """
+
+    GARBAGE = "garbage"
+    """
+    The Sonic garbage-bin task dataset (all_merged).
+    """
+
 # Embodiment tag string: to projector index in the Action Expert Module
 EMBODIMENT_TAG_MAPPING = {
     EmbodimentTag.NEW_EMBODIMENT.value: 31,
@@ -61,6 +81,10 @@ EMBODIMENT_TAG_MAPPING = {
     EmbodimentTag.AGIBOT_GENIE1.value: 26,
     EmbodimentTag.GR1.value: 24,
     EmbodimentTag.FRANKA.value: 25,
+    EmbodimentTag.SONIC_HUMANOID.value: 27,
+    EmbodimentTag.G1_HANDOVER.value: 28,
+    EmbodimentTag.G1_PICK_BETWEEN_TABLES.value: 29,
+    EmbodimentTag.GARBAGE.value: 30,
 }
 
 # Robot type to embodiment tag mapping
@@ -71,5 +95,8 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     "oxe_rt1": EmbodimentTag.OXE_RT1,
     "demo_sim_franka_delta_joints": EmbodimentTag.FRANKA,
     "custom_robot_config": EmbodimentTag.NEW_EMBODIMENT,
-    "sonic_latent_humanoid": EmbodimentTag.NEW_EMBODIMENT,
+    "sonic_latent_humanoid": EmbodimentTag.SONIC_HUMANOID,
+    "garbage": EmbodimentTag.GARBAGE,
+    "g1_handover": EmbodimentTag.G1_HANDOVER,
+    "g1_pick_between_tables": EmbodimentTag.G1_PICK_BETWEEN_TABLES,
 }
