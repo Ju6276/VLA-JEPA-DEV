@@ -87,4 +87,12 @@ DATASET_NAMED_MIXTURES = {
         ("dataset/G1WholebodyLocomotionPickBetweenTablesTeleop-v0", 1.0, "g1_pick_between_tables"),
     ],
 
+    "g1_pick_hug_container": [
+        ("dataset/G1WholebodyPickAndPlaceAndHugContainerTeleop-v0", 1.0, "g1_pick_hug_container"),
+    ],
+
+    "g1_open_oven": [
+        ("dataset/G1WholebodyOpenOvenTeleop-v0", 1.0, "g1_open_oven"),
+    ],
+
 }

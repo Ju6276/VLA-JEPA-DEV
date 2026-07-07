@@ -67,6 +67,16 @@ class EmbodimentTag(Enum):
     The G1 wholebody locomotion pick between tables teleop dataset.
     """
 
+    G1_PICK_HUG_CONTAINER = "g1_pick_hug_container"
+    """
+    The G1 wholebody pick-and-place and hug container teleop dataset.
+    """
+
+    G1_OPEN_OVEN = "g1_open_oven"
+    """
+    The G1 wholebody open oven teleop dataset.
+    """
+
     GARBAGE = "garbage"
     """
     The Sonic garbage-bin task dataset (all_merged).
@@ -84,6 +94,8 @@ EMBODIMENT_TAG_MAPPING = {
     EmbodimentTag.SONIC_HUMANOID.value: 27,
     EmbodimentTag.G1_HANDOVER.value: 28,
     EmbodimentTag.G1_PICK_BETWEEN_TABLES.value: 29,
+    EmbodimentTag.G1_PICK_HUG_CONTAINER.value: 20,
+    EmbodimentTag.G1_OPEN_OVEN.value: 21,
     EmbodimentTag.GARBAGE.value: 30,
 }
 
@@ -99,4 +111,6 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     "garbage": EmbodimentTag.GARBAGE,
     "g1_handover": EmbodimentTag.G1_HANDOVER,
     "g1_pick_between_tables": EmbodimentTag.G1_PICK_BETWEEN_TABLES,
+    "g1_pick_hug_container": EmbodimentTag.G1_PICK_HUG_CONTAINER,
+    "g1_open_oven": EmbodimentTag.G1_OPEN_OVEN,
 }
