@@ -1,4 +1,4 @@
-run_id: g1_pick_hug_container_ft
+run_id: g1_open_faucet_ft
 run_root_dir: checkpoints
 seed: 42
 trackers:
@@ -57,7 +57,7 @@ datasets:
   vla_data:
     dataset_py: lerobot_datasets
     data_root_dir: /cpfs_infra/shared/xiaoxinyu/VLA-JEPA/VLA-JEPA-DEV
-    data_mix: g1_pick_hug_container
+    data_mix: g1_open_faucet
     action_type: joint
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
     resolution_size: 224
@@ -74,13 +74,11 @@ datasets:
 
 trainer:
   epochs: 100
-  # Resume from steps_30000: train 10000 more steps (30000 + 10000 = 40000 total).
-  # After training, rename checkpoints/.../steps_10000_pytorch_model.pt -> steps_40000_pytorch_model.pt
-  max_train_steps: 10000
-  num_warmup_steps: 0
+  max_train_steps: 40000
+  num_warmup_steps: 2000
   save_interval: 10000
   eval_interval: 500
-  pretrained_checkpoint: checkpoints/g1_pick_hug_container_ft/checkpoints/steps_30000_pytorch_model.pt
+  pretrained_checkpoint: null
   learning_rate:
     base: 3.0e-05
     qwen_vl_interface: 1.0e-05

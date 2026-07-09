@@ -95,4 +95,8 @@ DATASET_NAMED_MIXTURES = {
         ("dataset/G1WholebodyOpenOvenTeleop-v0", 1.0, "g1_open_oven"),
     ],
 
+    "g1_open_faucet": [
+        ("dataset/G1WholebodyOpenFaucetTeleop-v0", 1.0, "g1_open_faucet"),
+    ],
+
 }

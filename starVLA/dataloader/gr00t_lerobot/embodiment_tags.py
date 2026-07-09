@@ -77,6 +77,11 @@ class EmbodimentTag(Enum):
     The G1 wholebody open oven teleop dataset.
     """
 
+    G1_OPEN_FAUCET = "g1_open_faucet"
+    """
+    The G1 wholebody open faucet teleop dataset.
+    """
+
     GARBAGE = "garbage"
     """
     The Sonic garbage-bin task dataset (all_merged).
@@ -96,6 +101,7 @@ EMBODIMENT_TAG_MAPPING = {
     EmbodimentTag.G1_PICK_BETWEEN_TABLES.value: 29,
     EmbodimentTag.G1_PICK_HUG_CONTAINER.value: 20,
     EmbodimentTag.G1_OPEN_OVEN.value: 21,
+    EmbodimentTag.G1_OPEN_FAUCET.value: 22,
     EmbodimentTag.GARBAGE.value: 30,
 }
 
@@ -113,4 +119,5 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     "g1_pick_between_tables": EmbodimentTag.G1_PICK_BETWEEN_TABLES,
     "g1_pick_hug_container": EmbodimentTag.G1_PICK_HUG_CONTAINER,
     "g1_open_oven": EmbodimentTag.G1_OPEN_OVEN,
+    "g1_open_faucet": EmbodimentTag.G1_OPEN_FAUCET,
 }
