@@ -99,4 +99,8 @@ DATASET_NAMED_MIXTURES = {
         ("dataset/G1WholebodyOpenFaucetTeleop-v0", 1.0, "g1_open_faucet"),
     ],
 
+    "g1_open_trash_can": [
+        ("dataset/G1WholebodyOpenTrashCanTeleop-v0", 1.0, "g1_open_trash_can"),
+    ],
+
 }

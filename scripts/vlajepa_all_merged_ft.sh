@@ -1,5 +1,6 @@
 #!/bin/bash
 # Fine-tune VLA-JEPA on all_merged (Sonic garbage-bin task).
+# World-model encoder: V-JEPA 2.1 ViT-L/384 (weights under VJEPA21/).
 # Usage:
 #   bash scripts/vlajepa_all_merged_ft.sh
 #   NUM_PROCESSES=4 bash scripts/vlajepa_all_merged_ft.sh
@@ -28,7 +29,7 @@ export OMP_NUM_THREADS=1
 
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_ENTITY="${WANDB_ENTITY:-xinyu-xiao-kinetix-ai}"
-export WANDB_PROJECT="${WANDB_PROJECT:-VLA_JEPA_garbage}"
+export WANDB_PROJECT="${WANDB_PROJECT:-VLA_JEPA_garbage_vjepa21}"
 
 if [[ "${WANDB_MODE}" == "online" && -z "${WANDB_API_KEY:-}" ]]; then
   echo "Warning: WANDB_API_KEY is not set. Set WANDB_MODE=offline to train without W&B."
@@ -36,8 +37,10 @@ fi
 
 NUM_PROCESSES="${NUM_PROCESSES:-8}"
 echo "Using NUM_PROCESSES=${NUM_PROCESSES}"
-echo "Config: scripts/config/vlajepa_all_merged_ft.yaml"
+echo "Config: scripts/config/vlajepa_all_merged_ft.yaml (V-JEPA 2.1, 384px)"
+echo "Encoder: VJEPA21/vjepa2_1_vitl_dist_vitG_384.pt"
 echo "Dataset: dataset/all_merged"
+echo "Output: checkpoints/all_merged_vjepa21_ft"
 
 accelerate launch \
   --config_file ./starVLA/config/deepseeds/deepspeed_zero2.yaml \

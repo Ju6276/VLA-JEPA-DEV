@@ -1085,6 +1085,7 @@ ROBOT_TYPE_CONFIG_MAP = {
     "g1_pick_hug_container": G1HandoverDataConfig,
     "g1_open_oven": G1HandoverDataConfig,
     "g1_open_faucet": G1HandoverDataConfig,
+    "g1_open_trash_can": G1HandoverDataConfig,
     #"demo_sim_franka_delta_joints": SingleFrankaRobotiqDeltaJointsDataConfig(),
     #"custom_robot_config": SingleFrankaRobotiqDeltaEefDataConfig()
 }
