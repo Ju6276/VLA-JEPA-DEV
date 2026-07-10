@@ -10,6 +10,12 @@ from starVLA.model.framework.base_framework import baseframework
 import torch, os
 
 
+DEFAULT_OPENFAUCET_CKPT = (
+    "/home/d013/桌面/CKPT/JEPA2/SIMPLE_OPENFAUCET__30/"
+    "steps_40000_pytorch_model.pt"
+)
+
+
 def main(args) -> None:
     # Example usage:
     # policy = YourPolicyClass()  # Replace with your actual policy class
@@ -43,7 +49,7 @@ def main(args) -> None:
 
 def build_argparser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt_path", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
+    parser.add_argument("--ckpt_path", type=str, default=DEFAULT_OPENFAUCET_CKPT)
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
     parser.add_argument("--cuda", default=0)
