@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 : "${SimplerEnv_PATH:=/home/dataset-local/SimplerEnv}"
 export sim_python
 export SimplerEnv_PATH
-MODEL_PATH=/home/dataset-local/starVLA_A100/checkpoints/direct_ft/oxe/JEVLA_wo_human/checkpoints/steps_120000_pytorch_model.pt
+MODEL_PATH=/home/d013/桌面/CKPT/JEPA2/SIMPLE_OPENFAUCET__30/steps_40000_pytorch_model.pt
 
 sim_python="${sim_python}" SimplerEnv_PATH="${SimplerEnv_PATH}" bash "${SCRIPT_DIR}/star_bridge.sh" "${MODEL_PATH}"
 
