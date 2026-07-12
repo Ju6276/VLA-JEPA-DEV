@@ -31,6 +31,7 @@ _ACTION_TOKEN_MAX = 153712 # here only for fast_tokenizer, see starVLA/model/mod
 
 
 import torch.nn as nn
+from starVLA.model.framework.share_tools import resolve_model_id_or_path
 
 
 class _QWen_VL_Interface(nn.Module):
@@ -83,14 +84,36 @@ class _QWen_VL_Interface(nn.Module):
         super().__init__()
 
         qwenvl_config = config.framework.get("qwenvl", {})
-        model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen2.5-VL-3B-Instruct")
-
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_id,
-            attn_implementation="flash_attention_2",
-            torch_dtype="auto",
-            device_map="cuda",
+        model_id = resolve_model_id_or_path(
+            qwenvl_config.get("base_vlm", "Qwen/Qwen2.5-VL-3B-Instruct")
         )
+        attn_implementation = qwenvl_config.get("attn_implementation", "flash_attention_2")
+        fallback_attn_implementation = qwenvl_config.get("fallback_attn_implementation", "sdpa")
+
+        load_kwargs = {
+            "attn_implementation": attn_implementation,
+            "torch_dtype": "auto",
+            "device_map": "cuda",
+        }
+        try:
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_id,
+                **load_kwargs,
+            )
+        except ImportError as exc:
+            if attn_implementation != "flash_attention_2":
+                raise
+            logger.warning(
+                "Failed to load Qwen2.5-VL with attn_implementation=%s: %s. Falling back to %s.",
+                attn_implementation,
+                exc,
+                fallback_attn_implementation,
+            )
+            load_kwargs["attn_implementation"] = fallback_attn_implementation
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_id,
+                **load_kwargs,
+            )
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 

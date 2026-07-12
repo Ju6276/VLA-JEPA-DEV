@@ -65,6 +65,10 @@ DATASET_NAMED_MIXTURES = {
         ("custom_dataset_name_2", 1.0, "custom_robot_config"),
     ],
 
+    "sonic_latent": [
+        ("merged_dataset_001", 1.0, "sonic_latent"),
+    ],
+
     "BEHAVIOR_challenge": [
         ("BEHAVIOR_challenge", 1.0, "R1Pro"),
     ],

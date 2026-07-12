@@ -782,6 +782,89 @@ class SingleFrankaRobotiqDeltaJointsDataConfig:
 ###########################################################################################
 
 
+class SonicLatentActionDataConfig:
+    video_keys = [
+        "video.ego_view",
+    ]
+    state_keys = [
+        "state.left_leg",
+        "state.right_leg",
+        "state.waist",
+        "state.left_arm",
+        "state.left_hand",
+        "state.right_arm",
+        "state.right_hand",
+        "state.projected_gravity",
+    ]
+    action_keys = [
+        "action.motion_token",
+        "action.left_hand_joints",
+        "action.right_hand_joints",
+    ]
+    language_keys = ["annotation.human.task_description"]
+
+    def __init__(self, observation_indices, action_indices):
+        self.observation_indices = observation_indices
+        self.action_indices = action_indices
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        modality_configs = {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+        return modality_configs
+
+    def transform(self):
+        transforms = [
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.left_leg": "q99",
+                    "state.right_leg": "q99",
+                    "state.waist": "q99",
+                    "state.left_arm": "q99",
+                    "state.left_hand": "q99",
+                    "state.right_arm": "q99",
+                    "state.right_hand": "q99",
+                    "state.projected_gravity": "q99",
+                },
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.motion_token": "q99",
+                    "action.left_hand_joints": "q99",
+                    "action.right_hand_joints": "q99",
+                },
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+
+###########################################################################################
+
+
 
 ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig,
@@ -790,6 +873,7 @@ ROBOT_TYPE_CONFIG_MAP = {
     #"oxe_droid": OxeDroidDataConfig(),
     "oxe_bridge": OxeBridgeDataConfig,
     "oxe_rt1": OxeRT1DataConfig,
+    "sonic_latent": SonicLatentActionDataConfig,
     #"demo_sim_franka_delta_joints": SingleFrankaRobotiqDeltaJointsDataConfig(),
     #"custom_robot_config": SingleFrankaRobotiqDeltaEefDataConfig()
 }

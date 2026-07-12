@@ -14,6 +14,7 @@ import imageio
 import numpy as np
 import tqdm
 import tyro
+from typing import Union
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -22,7 +23,7 @@ from examples.LIBERO.model2libero_interface import M1Inference
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
-def _binarize_gripper_open(open_val: np.ndarray | float) -> np.ndarray:
+def _binarize_gripper_open(open_val: Union[np.ndarray, float]) -> np.ndarray:
     arr = np.asarray(open_val, dtype=np.float32).reshape(-1)
     v = float(arr[0])
     bin_val = 1.0 - 2.0 * (v > 0.5)

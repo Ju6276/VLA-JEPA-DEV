@@ -140,6 +140,52 @@ def _to_omegaconf(x: Any):
     return OmegaConf.create(x)
 
 
+def resolve_model_id_or_path(model_id_or_path: Any) -> Any:
+    """
+    Resolve a model reference to a usable local path when a checkpoint contains
+    machine-specific absolute paths from another environment.
+
+    Resolution order:
+      1. Return non-string inputs unchanged.
+      2. If the given path already exists, use it.
+      3. If it is a relative path, try resolving it from the repo root.
+      4. If it is a stale absolute path, fall back to a repo-local directory
+         with the same basename (e.g. Qwen3-VL-2B-Instruct).
+
+    Args:
+        model_id_or_path: Hugging Face repo id or filesystem path.
+
+    Returns:
+        str | Any: Resolved path string when found, else original input.
+    """
+    if not isinstance(model_id_or_path, str) or not model_id_or_path:
+        return model_id_or_path
+
+    candidate = Path(model_id_or_path).expanduser()
+    if candidate.exists():
+        return str(candidate)
+
+    repo_root = Path(__file__).resolve().parents[3]
+    fallback_candidates = []
+
+    if not candidate.is_absolute():
+        fallback_candidates.append((repo_root / candidate).resolve())
+
+    fallback_candidates.append(repo_root / candidate.name)
+    fallback_candidates.append(repo_root / "playground" / "Pretrained_models" / candidate.name)
+
+    for fallback in fallback_candidates:
+        if fallback.exists():
+            overwatch.info(
+                "Resolved unavailable model path `%s` to local path `%s`",
+                model_id_or_path,
+                fallback,
+            )
+            return str(fallback)
+
+    return model_id_or_path
+
+
 def merge_pram_config(init):
     """
     Decorator for __init__ to unify config handling.
@@ -227,10 +273,26 @@ def read_model_config(pretrained_checkpoint):
 
         # [Validate] Checkpoint Path should look like `.../<RUN_ID>/checkpoints/<CHECKPOINT_PATH>.pt`
         assert checkpoint_pt.suffix == ".pt"
-        run_dir = checkpoint_pt.parents[1]
+        candidate_run_dirs = [
+            checkpoint_pt.parent,
+            checkpoint_pt.parents[1],
+        ]
+        run_dir = None
+        config_json = None
+        dataset_statistics_json = None
+        for candidate in candidate_run_dirs:
+            candidate_config = candidate / "config.json"
+            candidate_stats = candidate / "dataset_statistics.json"
+            if candidate_config.exists() and candidate_stats.exists():
+                run_dir = candidate
+                config_json = candidate_config
+                dataset_statistics_json = candidate_stats
+                break
 
-        # Get paths for `config.json`, `dataset_statistics.json` and pretrained checkpoint
-        config_json, dataset_statistics_json = run_dir / "config.json", run_dir / "dataset_statistics.json"
+        assert run_dir is not None, (
+            "Missing `config.json` / `dataset_statistics.json` next to checkpoint. "
+            f"Tried: {[str(c) for c in candidate_run_dirs]}"
+        )
         assert config_json.exists(), f"Missing `config.json` for `{run_dir = }`"
         assert dataset_statistics_json.exists(), f"Missing `dataset_statistics.json` for `{run_dir = }`"
 
@@ -265,10 +327,26 @@ def read_mode_config(pretrained_checkpoint):
 
         # [Validate] Checkpoint Path should look like `.../<RUN_ID>/checkpoints/<CHECKPOINT_PATH>.pt`
         assert checkpoint_pt.suffix == ".pt"
-        run_dir = checkpoint_pt.parents[1]
+        candidate_run_dirs = [
+            checkpoint_pt.parent,
+            checkpoint_pt.parents[1],
+        ]
+        run_dir = None
+        config_yaml = None
+        dataset_statistics_json = None
+        for candidate in candidate_run_dirs:
+            candidate_config = candidate / "config.yaml"
+            candidate_stats = candidate / "dataset_statistics.json"
+            if candidate_config.exists() and candidate_stats.exists():
+                run_dir = candidate
+                config_yaml = candidate_config
+                dataset_statistics_json = candidate_stats
+                break
 
-        # Get paths for `config.json`, `dataset_statistics.json` and pretrained checkpoint
-        config_yaml, dataset_statistics_json = run_dir / "config.yaml", run_dir / "dataset_statistics.json"
+        assert run_dir is not None, (
+            "Missing `config.yaml` / `dataset_statistics.json` next to checkpoint. "
+            f"Tried: {[str(c) for c in candidate_run_dirs]}"
+        )
         assert config_yaml.exists(), f"Missing `config.yaml` for `{run_dir = }`"
         assert dataset_statistics_json.exists(), f"Missing `dataset_statistics.json` for `{run_dir = }`"
 

@@ -25,8 +25,15 @@ logger = initialize_overwatch(__name__)
 IGNORE_INDEX = -100
 
 from starVLA.model.framework.base_framework import baseframework
+from starVLA.model.framework.share_tools import resolve_model_id_or_path
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
+from starVLA.model.modules.world_model.local_vjepa_encoder import (
+    LocalVJEPAVideoProcessor,
+    VJEPA2LocalEncoderModel,
+    load_local_vjepa_encoder_checkpoint,
+    resolve_local_vjepa_checkpoint,
+)
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
@@ -78,17 +85,29 @@ class VLA_JEPA(baseframework):
         self.past_action_window_size = config.framework.action_model.past_action_window_size
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
         
-        self.vj_encoder = AutoModel.from_pretrained(self.config.framework.vj2_model.base_encoder)
-        self.vj_processor = AutoVideoProcessor.from_pretrained(self.config.framework.vj2_model.base_encoder)
+        vj_base_encoder = resolve_model_id_or_path(self.config.framework.vj2_model.base_encoder)
+        local_vjepa_checkpoint = resolve_local_vjepa_checkpoint(vj_base_encoder)
+        if local_vjepa_checkpoint is not None:
+            self.vj_encoder = VJEPA2LocalEncoderModel(
+                image_size=self.config.framework.vj2_model.get("image_size", 384),
+                depth=self.config.framework.vj2_model.get("encoder_depth", 24),
+                num_heads=self.config.framework.vj2_model.get("encoder_num_heads", 16),
+            )
+            load_local_vjepa_encoder_checkpoint(self.vj_encoder, local_vjepa_checkpoint)
+            self.vj_processor = LocalVJEPAVideoProcessor(size=self.vj_encoder.config.image_size)
+        else:
+            self.vj_encoder = AutoModel.from_pretrained(vj_base_encoder)
+            self.vj_processor = AutoVideoProcessor.from_pretrained(vj_base_encoder)
 
         tubelet_size = self.vj_encoder.config.tubelet_size
+        num_video_views = self.config.framework.vj2_model.get("num_video_views", 1)
         self.vj_predictor = VisionTransformerPredictorAC(
             num_frames=self.config.framework.vj2_model.num_frames//tubelet_size,
             img_size=((self.vj_encoder.config.image_size, self.vj_encoder.config.image_size)),
             tubelet_size=1,
             depth=self.config.framework.vj2_model.depth,
             num_heads=self.config.framework.vj2_model.num_heads,
-            embed_dim=self.vj_encoder.config.hidden_size * 2, # multi view
+            embed_dim=self.vj_encoder.config.hidden_size * num_video_views,
             action_embed_dim=self.qwen_vl_interface.model.config.hidden_size,
             num_add_tokens=self.config.framework.vj2_model.num_action_tokens_per_timestep,
         )

@@ -44,11 +44,33 @@ from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
 
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(
-    deepspeed_plugin=deepspeed_plugin,
-)
-accelerator.print(accelerator.state)
+def _dist_ready() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _is_rank0() -> bool:
+    return (not _dist_ready()) or dist.get_rank() == 0
+
+
+def _safe_barrier() -> None:
+    if _dist_ready():
+        dist.barrier()
+
+
+def build_accelerator(gradient_accumulation_steps: int) -> Accelerator:
+    if os.environ.get("VLA_USE_DEEPSPEED", "0") == "1":
+        deepspeed_plugin = DeepSpeedPlugin()
+        accelerator = Accelerator(
+            deepspeed_plugin=deepspeed_plugin,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
+    else:
+        accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation_steps)
+    accelerator.print(accelerator.state)
+    return accelerator
+
+
+accelerator = None
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -103,7 +125,7 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader]:
     vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
 
     accelerator.dataloader_config.dispatch_batches = False
-    dist.barrier()
+    _safe_barrier()
 
     return vla_train_dataloader
 
@@ -184,7 +206,7 @@ class VLATrainer(TrainerUtils):
             # self.vlm_train_dataloader
         )
 
-        #self._init_wandb()
+        self._init_wandb()
         self._init_checkpointing()
 
     def _calculate_total_batch_size(self):
@@ -197,7 +219,8 @@ class VLATrainer(TrainerUtils):
 
     def _init_wandb(self):
         """initialize Weights & Biases"""
-        if self.accelerator.is_main_process:
+        trackers = getattr(self.config, "trackers", [])
+        if self.accelerator.is_main_process and "wandb" in trackers:
             wandb.init(
                 name=self.config.run_id,
                 dir=os.path.join(self.config.output_dir, "wandb"),
@@ -245,7 +268,7 @@ class VLATrainer(TrainerUtils):
     def _log_metrics(self, metrics):
         """record training metrics"""
         if self.completed_steps % self.config.trainer.logging_frequency == 0:
-            if dist.get_rank() == 0:
+            if _is_rank0():
                 # add learning rate
                 metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
 
@@ -253,7 +276,8 @@ class VLATrainer(TrainerUtils):
                 metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
 
                 # record to W&B
-                #wandb.log(metrics, step=self.completed_steps)
+                if "wandb" in getattr(self.config, "trackers", []):
+                    wandb.log(metrics, step=self.completed_steps)
                 # debug output
                 logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
@@ -461,7 +485,7 @@ class VLATrainer(TrainerUtils):
             self.writer.add_scalar("mse_score", step_metrics["mse_score"], self.completed_steps)
         
         pass
-        dist.barrier()  # ensure all processes are synchronized
+        _safe_barrier()  # ensure all processes are synchronized
         return step_metrics
 
     def _log_training_config(self):
@@ -476,7 +500,7 @@ class VLATrainer(TrainerUtils):
     def _train_step(self, batch_vla, batch_vlm=None):
         """execute single training step"""
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             # VLA task forward propagation
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
@@ -509,13 +533,16 @@ class VLATrainer(TrainerUtils):
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
         # close W&B
-        #if self.accelerator.is_main_process:
-        #    wandb.finish()
+        if self.accelerator.is_main_process and "wandb" in getattr(self.config, "trackers", []):
+            wandb.finish()
 
         self.accelerator.wait_for_everyone()
 
 
 def main(cfg) -> None:
+    global accelerator
+    gradient_accumulation_steps = int(getattr(cfg.trainer, "gradient_accumulation_steps", 1) or 1)
+    accelerator = build_accelerator(gradient_accumulation_steps)
     logger.info("VLA Training :: Warming Up")
 
     # create output directory and save config
@@ -546,8 +573,9 @@ def main(cfg) -> None:
 
     # And... we're done!
     logger.info("... and that's all, folks!")
-    dist.barrier()
-    dist.destroy_process_group()
+    _safe_barrier()
+    if _dist_ready():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -562,7 +590,7 @@ if __name__ == "__main__":
     cfg = OmegaConf.merge(cfg, cli_cfg)
 
     # if cfg.is_debug:
-    if cfg.is_debug and dist.is_initialized() and dist.get_rank() == 0:
+    if cfg.is_debug and _is_rank0():
         import debugpy
         debugpy.listen(("0.0.0.0", 10092))
         print("🔍 Rank 0 waiting for debugger attach on port 10092...")

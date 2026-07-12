@@ -65,6 +65,7 @@ def get_vla_dataset(
     """
     data_root_dir = data_cfg.data_root_dir
     data_mix = data_cfg.data_mix
+    delete_pause_frame = data_cfg.get("delete_pause_frame", delete_pause_frame)
     mixture_spec = DATASET_NAMED_MIXTURES[data_mix]
     included_datasets, filtered_mixture_spec = set(), []
     for d_name, d_weight, robot_type in mixture_spec:  

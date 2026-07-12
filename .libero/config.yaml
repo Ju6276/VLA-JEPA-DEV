@@ -1,0 +1,5 @@
+benchmark_root: /home/d013/桌面/LIBERO/libero/libero
+bddl_files: /home/d013/桌面/LIBERO/libero/libero/bddl_files
+init_states: /home/d013/桌面/LIBERO/libero/libero/init_files
+datasets: /home/d013/桌面/VLA-JEPA/.libero/datasets
+assets: /home/d013/桌面/LIBERO/libero/libero/assets

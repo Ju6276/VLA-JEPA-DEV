@@ -69,6 +69,7 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     "oxe_droid": EmbodimentTag.OXE_DROID,
     "oxe_bridge": EmbodimentTag.OXE_BRIDGE,
     "oxe_rt1": EmbodimentTag.OXE_RT1,
+    "sonic_latent": EmbodimentTag.NEW_EMBODIMENT,
     "demo_sim_franka_delta_joints": EmbodimentTag.FRANKA,
     "custom_robot_config": EmbodimentTag.NEW_EMBODIMENT,
 }
