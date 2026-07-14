@@ -11,6 +11,9 @@ EXCLUDED_DIRS=(
   "Qwen3-VL-2B-Instruct"
   "vjepa2-vitl-fpc64-256"
   "VJEPA21"
+  ".venv"
+  "venv"
+  "env"
 )
 
 EXCLUDE_PATHSPECS=(
@@ -19,6 +22,12 @@ EXCLUDE_PATHSPECS=(
   ":(exclude)Qwen3-VL-2B-Instruct/**"
   ":(exclude)vjepa2-vitl-fpc64-256/**"
   ":(exclude)VJEPA21/**"
+  ":(exclude).venv/**"
+  ":(exclude)venv/**"
+  ":(exclude)env/**"
+  ":(exclude).env"
+  ":(exclude).env.*"
+  ":(exclude).python-version"
 )
 
 usage() {
@@ -29,8 +38,11 @@ Usage:
 Default:
   Sync the current repo to GitHub branch ${BRANCH}.
 
-Excluded directories:
+Excluded local paths:
 $(printf '  - %s\n' "${EXCLUDED_DIRS[@]}")
+  - .env
+  - .env.*
+  - .python-version
 EOF
 }
 
@@ -67,8 +79,8 @@ if [[ "$CURRENT_BRANCH" != "$BRANCH" ]]; then
   fi
 fi
 
-# Keep excluded heavy/local directories out of the commit even if they were staged earlier.
-git restore --staged -- "${EXCLUDED_DIRS[@]}" >/dev/null 2>&1 || true
+# Keep excluded heavy/local files out of the commit even if they were staged earlier.
+git restore --staged -- "${EXCLUDED_DIRS[@]}" ".env" ".env.*" ".python-version" >/dev/null 2>&1 || true
 
 git add -A -- . "${EXCLUDE_PATHSPECS[@]}"
 

@@ -20,7 +20,7 @@ DEFAULT_OPENFAUCET_CKPT = (
     "steps_40000_pytorch_model.pt"
 )
 DEFAULT_BASE_VLM_PATH = "/home/d013/桌面/VLA-JEPA/Qwen3-VL-2B-Instruct"
-DEFAULT_BASE_ENCODER_PATH = "/home/d013/桌面/VLA-JEPA/vjepa2-vitl-fpc64-256"
+DEFAULT_BASE_ENCODER_PATH = "/home/d013/桌面/VLA-JEPA/VJEPA21"
 
 
 def main(args) -> None:
