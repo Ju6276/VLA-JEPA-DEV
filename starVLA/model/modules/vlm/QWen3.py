@@ -13,6 +13,10 @@ from transformers import BatchFeature
 
 from qwen_vl_utils import process_vision_info
 
+from starVLA.model.modules.vlm.attn_utils import (
+    resolve_attn_implementation,
+    resolve_qwen_device_map,
+)
 
 from accelerate.logging import get_logger
 
@@ -54,13 +58,29 @@ class _QWen3_VL_Interface(nn.Module):
 
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3-VL-4B-Instruct")
-        attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
+        requested_attn = qwenvl_config.get("attn_implementation", "sdpa")
+        attn_implementation = resolve_attn_implementation(requested_attn)
+        device_map = resolve_qwen_device_map(qwenvl_config)
+
+        if attn_implementation != requested_attn:
+            logger.warning(
+                "Using attn_implementation=%s (requested %s).",
+                attn_implementation,
+                requested_attn,
+            )
+        else:
+            logger.info("Using attn_implementation=%s.", attn_implementation)
+
+        load_kwargs = {
+            "attn_implementation": attn_implementation,
+            "dtype": torch.bfloat16,
+        }
+        if device_map is not None:
+            load_kwargs["device_map"] = device_map
 
         model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_id,
-            attn_implementation=attn_implementation,
-            dtype=torch.bfloat16,
-            device_map="cuda",
+            **load_kwargs,
         )
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"

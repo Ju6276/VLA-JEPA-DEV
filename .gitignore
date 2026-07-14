@@ -17,6 +17,7 @@ checkpoints/
 dataset/
 Qwen3-VL-2B-Instruct/
 vjepa2-vitl-fpc64-256/
+VJEPA21/
 data/
 wandb/
 *.pt

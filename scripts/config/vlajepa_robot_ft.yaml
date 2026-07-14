@@ -38,7 +38,7 @@ framework:
       output_dim: 1024
       positional_embeddings: null
   vj2_model:
-    base_encoder: /home/dataset-local/models/vjepa2-vitl-fpc64-256
+    base_encoder: /cpfs_infra/shared/xiaoxinyu/VLA-JEPA/VLA-JEPA-DEV/VJEPA21/vjepa2_1_vitl_dist_vitG_384.pt
     depth: 12
     num_heads: 8
     special_action_token: <|action_{}|>
@@ -59,7 +59,7 @@ datasets:
     #CoT_answer: bbox
     resolution_size: 224   # image input of VLA will be resized and video will not, video will be precessed by world model videoprocessor
     per_device_batch_size: 32
-    video_resolution_size: 256
+    video_resolution_size: 384
     load_all_data_for_training: true
     with_state: true
 

@@ -1,26 +1,45 @@
+#!/bin/bash
+# Train VLA-JEPA on merged_dataset_001 with sonic latent-action config (V-JEPA 2.1, 384px).
+# Usage:
+#   bash scripts/vlajepa_sonic_latent_vjepa21.sh
+#   NUM_PROCESSES=4 bash scripts/vlajepa_sonic_latent_vjepa21.sh
+
+set -e
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${PROJECT_ROOT}"
+
+CONDA_SH="/cpfs_infra/shared/xiaoxinyu/opt/miniconda3/etc/profile.d/conda.sh"
+if [ -f "${CONDA_SH}" ]; then
+  source "${CONDA_SH}"
+  conda activate VLA_JEPA
+else
+  export PATH="/cpfs_infra/shared/xiaoxinyu/opt/miniconda3/envs/VLA_JEPA/bin:${PATH}"
+fi
+
 export NCCL_IB_DISABLE=1
 export NCCL_SOCKET_IFNAME=eth0
-# used for check save when communication
 export NCCL_BLOCKING_WAIT=1
 export NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_TIMEOUT=1000  # timeout set to 1 hour (unit: seconds)
-#export NCCL_DEBUG=INFO
-#export NCCL_DEBUG_SUBSYS=ALL
+export NCCL_TIMEOUT=1000
+export TMPDIR=/tmp
 export FFMPEG_THREADS=1
 export OMP_NUM_THREADS=1
 
-export WANDB_MODE=online
-export WANDB_ENTITY="${WANDB_ENTITY:-ju-dong6276-technical-university-of-munich}"
+export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_ENTITY="${WANDB_ENTITY:-xinyu-xiao-kinetix-ai}"
 export WANDB_PROJECT="${WANDB_PROJECT:-vlajepa_sonic_latent_vjepa21}"
 
 if [[ "${WANDB_MODE}" == "online" && -z "${WANDB_API_KEY:-}" ]]; then
-  echo "Error: WANDB_API_KEY is not set. Export it before training, e.g.:"
-  echo "  export WANDB_API_KEY=\"your_wandb_api_key\""
-  exit 1
+  echo "Warning: WANDB_API_KEY is not set. Set WANDB_MODE=offline to train without W&B."
 fi
 
-# Number of GPUs to use for training. Adjust to your machine.
 NUM_PROCESSES="${NUM_PROCESSES:-8}"
+echo "Using NUM_PROCESSES=${NUM_PROCESSES}"
+echo "Config: scripts/config/vlajepa_sonic_latent_vjepa21.yaml"
+echo "Dataset: dataset/merged_dataset_001 (data_mix: sonic_merged_dataset_001)"
+echo "Encoder: VJEPA21/vjepa2_1_vitl_dist_vitG_384.pt"
+echo "Output: checkpoints/sonic_latent_vjepa21"
 
 accelerate launch \
   --config_file ./starVLA/config/deepseeds/deepspeed_zero2.yaml \
