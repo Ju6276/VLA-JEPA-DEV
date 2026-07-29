@@ -174,3 +174,76 @@ class ActionDynamicsPrior(nn.Module):
         target = actions[:, 1:].to(device=prediction.device, dtype=prediction.dtype)
         error = (prediction - target).square()
         return error.mean(dim=(1, 2))
+
+
+class GoalConditionedActionProposal(nn.Module):
+    """Amortized action proposal conditioned on current and goal JEPA states."""
+
+    def __init__(
+        self,
+        latent_dim: int,
+        state_dim: int,
+        action_dim: int,
+        action_horizon: int,
+        hidden_dim: int = 512,
+    ) -> None:
+        super().__init__()
+        self.state_dim = state_dim
+        self.action_horizon = action_horizon
+        self.context_net = nn.Sequential(
+            nn.Linear(latent_dim * 3 + state_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.time_embedding = nn.Parameter(
+            torch.empty(action_horizon, hidden_dim)
+        )
+        nn.init.trunc_normal_(self.time_embedding, std=0.02)
+        self.action_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, action_dim),
+        )
+
+    def forward(
+        self,
+        z_current: torch.Tensor,
+        z_goal: torch.Tensor,
+        state: torch.Tensor | None,
+    ) -> torch.Tensor:
+        proposal_param = next(self.parameters())
+        z_current = z_current.to(
+            device=proposal_param.device,
+            dtype=proposal_param.dtype,
+        )
+        z_goal = z_goal.to(device=proposal_param.device, dtype=proposal_param.dtype)
+        if state is None:
+            state = z_current.new_zeros(z_current.shape[0], self.state_dim)
+        else:
+            if state.dim() == 3:
+                state = state[:, -1]
+            state = state.to(device=proposal_param.device, dtype=proposal_param.dtype)
+
+        context = torch.cat(
+            [z_current, z_goal, z_goal - z_current, state],
+            dim=-1,
+        )
+        context = self.context_net(context)
+        temporal_features = context.unsqueeze(1) + self.time_embedding.unsqueeze(0)
+        return self.action_head(temporal_features)
+
+    def loss(
+        self,
+        z_current: torch.Tensor,
+        z_goal: torch.Tensor,
+        state: torch.Tensor | None,
+        target_actions: torch.Tensor,
+    ) -> torch.Tensor:
+        prediction = self(z_current, z_goal, state)
+        target_actions = target_actions.to(
+            device=prediction.device,
+            dtype=prediction.dtype,
+        )
+        return F.mse_loss(prediction, target_actions)

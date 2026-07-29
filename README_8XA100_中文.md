@@ -76,11 +76,12 @@ GPU：8×A100
 梯度累积：1
 全局 batch size：256
 V-JEPA：V-JEPA 2.1 ViT-L 384px
-训练 loss：action + wm + delta + ctrl + action_prior
+训练 loss：action + wm + delta + ctrl + action_prior + goal_proposal
 Delta-JEPA：开启
 subgoal：开启
 verifier：默认开启
 候选动作数：8
+动作候选：1 个 goal-conditioned proposal + 7 个 Action Expert 采样
 ```
 
 显存不足时：
@@ -112,6 +113,7 @@ wm_loss
 delta_loss
 ctrl_loss
 action_prior_loss
+goal_proposal_loss
 ```
 
 ## 6. 启动默认 verifier 推理

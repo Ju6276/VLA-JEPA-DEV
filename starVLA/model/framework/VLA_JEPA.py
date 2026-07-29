@@ -31,6 +31,7 @@ from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPre
 from starVLA.model.modules.world_model.delta_jepa import (
     ActionDynamicsPrior,
     CandidateActionEncoder,
+    GoalConditionedActionProposal,
     LatentInverseDynamics,
     latent_progress_score,
     pool_last_temporal_frame,
@@ -136,6 +137,10 @@ class VLA_JEPA(baseframework):
         self.verifier_action_prior_weight = float(
             delta_cfg.get("verifier_action_prior_weight", 0.1)
         )
+        self.use_goal_action_proposal = bool(
+            delta_cfg.get("goal_action_proposal_enabled", False)
+        )
+        self.lambda_goal_proposal = float(delta_cfg.get("lambda_goal_proposal", 0.01))
         self.ctrl_action_step = delta_cfg.get("ctrl_action_step", "first")
         self.verifier_num_candidates = int(delta_cfg.get("verifier_num_candidates", 8))
         self.use_verifier_default = bool(delta_cfg.get("use_verifier", False))
@@ -175,6 +180,17 @@ class VLA_JEPA(baseframework):
                 hidden_dim=hidden_dim,
                 num_layers=int(delta_cfg.get("action_prior_num_layers", 2)),
             )
+            self.goal_action_proposal = (
+                GoalConditionedActionProposal(
+                    latent_dim=jepa_embed_dim,
+                    state_dim=state_dim,
+                    action_dim=action_dim,
+                    action_horizon=self.chunk_len,
+                    hidden_dim=hidden_dim,
+                )
+                if self.use_goal_action_proposal
+                else None
+            )
             logger.info(
                 "Delta-JEPA enabled: lambda_wm=%s lambda_delta=%s lambda_ctrl=%s "
                 "lambda_action_prior=%s",
@@ -187,6 +203,7 @@ class VLA_JEPA(baseframework):
             self.candidate_action_encoder = None
             self.inv_dyn_decoder = None
             self.action_dynamics_prior = None
+            self.goal_action_proposal = None
 
         self.subgoal_tracker: Optional[SubgoalTracker] = None
         if self.subgoals_path:
@@ -620,6 +637,21 @@ class VLA_JEPA(baseframework):
                 self.action_dynamics_prior.loss(actions_target, state_tensor)
                 * self.lambda_action_prior
             )
+            if self.goal_action_proposal is not None:
+                proposal_z_current = pool_last_temporal_frame(
+                    input_states,
+                    tokens_per_step,
+                )
+                proposal_z_goal = pool_vjepa_tokens(gt_states)
+                output["goal_proposal_loss"] = (
+                    self.goal_action_proposal.loss(
+                        proposal_z_current.detach(),
+                        proposal_z_goal.detach(),
+                        state_tensor,
+                        actions_target,
+                    )
+                    * self.lambda_goal_proposal
+                )
 
         return output
 
@@ -736,18 +768,39 @@ class VLA_JEPA(baseframework):
             else None
         )
 
-        candidates = self.sample_action_candidates(
-            embodied_action_tokens=embodied_action_tokens,
-            state=state_tensor,
-            num_candidates=num_candidates,
-        )
-
         z_goal = self._encode_goal_images(subgoal_images)
+
+        if self.goal_action_proposal is not None:
+            proposal = self.goal_action_proposal(
+                z_current,
+                z_goal,
+                state_tensor,
+            ).unsqueeze(1)
+            sampled_count = max(0, num_candidates - 1)
+            if sampled_count:
+                sampled_candidates = self.sample_action_candidates(
+                    embodied_action_tokens=embodied_action_tokens,
+                    state=state_tensor,
+                    num_candidates=sampled_count,
+                )
+                proposal = proposal.to(
+                    device=sampled_candidates.device,
+                    dtype=sampled_candidates.dtype,
+                )
+                candidates = torch.cat([proposal, sampled_candidates], dim=1)
+            else:
+                candidates = proposal
+        else:
+            candidates = self.sample_action_candidates(
+                embodied_action_tokens=embodied_action_tokens,
+                state=state_tensor,
+                num_candidates=num_candidates,
+            )
 
         best_scores = torch.full((candidates.shape[0],), -1e9, device=candidates.device)
         best_actions = candidates[:, 0]
 
-        for idx in range(num_candidates):
+        for idx in range(candidates.shape[1]):
             candidate_chunk = candidates[:, idx]
             candidate_cond = self._build_predictor_action_cond(action_tokens, candidate_chunk)
             _, _, predicted_states = self._predict_future_latent(video_embeddings, candidate_cond)
@@ -769,6 +822,7 @@ class VLA_JEPA(baseframework):
             "normalized_actions": best_actions.detach().cpu().numpy(),
             "verification_scores": best_scores.detach().cpu().numpy(),
             "all_candidates": candidates.detach().cpu().numpy(),
+            "goal_proposal_used": self.goal_action_proposal is not None,
             "subgoal_index": (
                 self.subgoal_tracker.current_index if self.subgoal_tracker is not None else None
             ),
