@@ -58,6 +58,9 @@ framework:
     lambda_wm: 0.1
     lambda_delta: 0.05
     lambda_ctrl: 0.02
+    lambda_action_prior: 0.01
+    action_prior_num_layers: 2
+    verifier_action_prior_weight: 0.1
     ctrl_action_step: first
     hidden_dim: 512
     verifier_num_candidates: 8

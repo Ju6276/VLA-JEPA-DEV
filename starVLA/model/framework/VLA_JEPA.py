@@ -29,6 +29,7 @@ from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
 from starVLA.model.modules.world_model.delta_jepa import (
+    ActionDynamicsPrior,
     CandidateActionEncoder,
     LatentInverseDynamics,
     latent_progress_score,
@@ -131,6 +132,10 @@ class VLA_JEPA(baseframework):
         self.lambda_wm = float(delta_cfg.get("lambda_wm", 0.1))
         self.lambda_delta = float(delta_cfg.get("lambda_delta", 0.05))
         self.lambda_ctrl = float(delta_cfg.get("lambda_ctrl", 0.02))
+        self.lambda_action_prior = float(delta_cfg.get("lambda_action_prior", 0.01))
+        self.verifier_action_prior_weight = float(
+            delta_cfg.get("verifier_action_prior_weight", 0.1)
+        )
         self.ctrl_action_step = delta_cfg.get("ctrl_action_step", "first")
         self.verifier_num_candidates = int(delta_cfg.get("verifier_num_candidates", 8))
         self.use_verifier_default = bool(delta_cfg.get("use_verifier", False))
@@ -164,15 +169,24 @@ class VLA_JEPA(baseframework):
                 action_dim=action_dim,
                 hidden_dim=hidden_dim,
             )
+            self.action_dynamics_prior = ActionDynamicsPrior(
+                action_dim=action_dim,
+                state_dim=state_dim,
+                hidden_dim=hidden_dim,
+                num_layers=int(delta_cfg.get("action_prior_num_layers", 2)),
+            )
             logger.info(
-                "Delta-JEPA enabled: lambda_wm=%s lambda_delta=%s lambda_ctrl=%s",
+                "Delta-JEPA enabled: lambda_wm=%s lambda_delta=%s lambda_ctrl=%s "
+                "lambda_action_prior=%s",
                 self.lambda_wm,
                 self.lambda_delta,
                 self.lambda_ctrl,
+                self.lambda_action_prior,
             )
         else:
             self.candidate_action_encoder = None
             self.inv_dyn_decoder = None
+            self.action_dynamics_prior = None
 
         self.subgoal_tracker: Optional[SubgoalTracker] = None
         if self.subgoals_path:
@@ -602,6 +616,10 @@ class VLA_JEPA(baseframework):
             )
             output["delta_loss"] = delta_losses["delta_loss"] * self.lambda_delta
             output["ctrl_loss"] = delta_losses["ctrl_loss"] * self.lambda_ctrl
+            output["action_prior_loss"] = (
+                self.action_dynamics_prior.loss(actions_target, state_tensor)
+                * self.lambda_action_prior
+            )
 
         return output
 
@@ -734,7 +752,15 @@ class VLA_JEPA(baseframework):
             candidate_cond = self._build_predictor_action_cond(action_tokens, candidate_chunk)
             _, _, predicted_states = self._predict_future_latent(video_embeddings, candidate_cond)
             z_predicted = pool_vjepa_tokens(predicted_states)
-            scores = latent_progress_score(z_current, z_predicted, z_goal)
+            goal_progress = latent_progress_score(z_current, z_predicted, z_goal)
+            action_prior_error = self.action_dynamics_prior.energy(
+                candidate_chunk,
+                state_tensor,
+            )
+            scores = (
+                goal_progress
+                - self.verifier_action_prior_weight * action_prior_error
+            )
             better = scores > best_scores
             best_scores = torch.where(better, scores, best_scores)
             best_actions = torch.where(better.unsqueeze(-1).unsqueeze(-1), candidate_chunk, best_actions)

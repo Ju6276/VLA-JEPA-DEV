@@ -76,7 +76,7 @@ GPU：8×A100
 梯度累积：1
 全局 batch size：256
 V-JEPA：V-JEPA 2.1 ViT-L 384px
-训练 loss：action + wm + delta + ctrl
+训练 loss：action + wm + delta + ctrl + action_prior
 Delta-JEPA：开启
 subgoal：开启
 verifier：默认开启
@@ -111,6 +111,7 @@ action_loss
 wm_loss
 delta_loss
 ctrl_loss
+action_prior_loss
 ```
 
 ## 6. 启动默认 verifier 推理
