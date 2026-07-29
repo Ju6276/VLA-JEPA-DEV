@@ -1,18 +1,21 @@
-run_id: g1_pick_between_tables_ft
+run_id: g1_pick_between_tables_delta_jepa_8xa100
 run_root_dir: checkpoints
 seed: 42
 trackers:
-- json
-- wandb
-wandb_entity: xinyu-xiao-kinetix-ai
-wandb_project: VLA_JEPA21_SIMPLE
+  - json
+  - wandb
+wandb_entity: null
+wandb_project: VLA_JEPA_G1_DELTA
 is_debug: false
+
 framework:
   name: VLA_JEPA
   qwenvl:
-    base_vlm: /cpfs_infra/shared/xiaoxinyu/VLA-JEPA/VLA-JEPA-DEV/Qwen3-VL-2B-Instruct
-    attn_implementation: sdpa
+    # 启动脚本会用 QWEN_MODEL 覆盖。
+    base_vlm: Qwen/Qwen3-VL-2B-Instruct
+    attn_implementation: flash_attention_2
     vl_hidden_dim: 2048
+
   action_model:
     action_model_type: DiT-B
     action_hidden_dim: 1024
@@ -40,8 +43,12 @@ framework:
       num_layers: 16
       output_dim: 1024
       positional_embeddings: null
+
   vj2_model:
-    base_encoder: /cpfs_infra/shared/xiaoxinyu/VLA-JEPA/VLA-JEPA-DEV/vjepa2-vitl-fpc64-256
+    # 启动脚本会用 VJEPA21_CKPT 覆盖。
+    base_encoder: /path/to/vjepa2_1_vitl_dist_vitG_384.pt
+    arch: vit_large
+    image_size: 384
     num_video_views: 1
     depth: 12
     num_heads: 8
@@ -50,6 +57,9 @@ framework:
     embodied_action_token: <|embodied_action|>
     num_embodied_action_tokens_per_instruction: 32
     num_frames: 8
+
+  # 当前实验改动默认全部开启。
+  # 训练输出 action/wm/delta/ctrl 四个 loss；verifier 在 predict_action() 时启用。
   delta_jepa:
     enabled: true
     blend_vlm_tokens: true
@@ -59,31 +69,33 @@ framework:
     ctrl_action_step: first
     hidden_dim: 512
     verifier_num_candidates: 8
-    use_verifier: false
+    use_verifier: true
     subgoal_tracking_mode: sequential
     subgoal_epsilon: 0.15
-    subgoals_path: null
-  reduce_in_full_precision: true
+    # 启动脚本会用 SUBGOALS_PATH 覆盖。
+    subgoals_path: /path/to/subgoals
 
+  reduce_in_full_precision: true
 
 datasets:
   vla_data:
     dataset_py: lerobot_datasets
-    data_root_dir: /cpfs_infra/shared/xiaoxinyu/VLA-JEPA/VLA-JEPA-DEV
+    # 该目录下应存在 dataset/G1WholebodyLocomotionPickBetweenTablesTeleop-v0。
+    # 启动脚本会用 DATA_ROOT 覆盖。
+    data_root_dir: /path/to/data_root
     data_mix: g1_pick_between_tables
     action_type: joint
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
     resolution_size: 224
     image_size: [224, 224]
+    video_resolution_size: 384
     per_device_batch_size: 32
-    video_resolution_size: 256
     load_all_data_for_training: true
     with_state: true
     delete_pause_frame: false
     duplicate_single_view: false
-    num_workers: 16
+    num_workers: 8
     prefetch_factor: 4
-
 
 trainer:
   epochs: 100
@@ -99,7 +111,7 @@ trainer:
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
-  freeze_modules: ''
+  freeze_modules: ""
   loss_scale:
     vla: 1.0
     vlm: 0.1
@@ -109,15 +121,13 @@ trainer:
   logging_frequency: 10
   gradient_clipping: 1.0
   gradient_accumulation_steps: 1
-
   optimizer:
     name: AdamW
     betas: [0.9, 0.95]
     eps: 1.0e-08
     weight_decay: 1.0e-08
-
   is_resume: false
   resume_epoch: null
   resume_step: null
-  enable_gradient_checkpointing: false
+  enable_gradient_checkpointing: true
   enable_mixed_precision_training: true

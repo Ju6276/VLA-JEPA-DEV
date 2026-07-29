@@ -28,8 +28,16 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
+from starVLA.model.modules.world_model.delta_jepa import (
+    CandidateActionEncoder,
+    LatentInverseDynamics,
+    latent_progress_score,
+    pool_last_temporal_frame,
+    pool_vjepa_tokens,
+)
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
+from starVLA.tools.subgoal_tracker import SubgoalTracker
 
 @FRAMEWORK_REGISTRY.register("VLA_JEPA")
 class VLA_JEPA(baseframework):
@@ -115,6 +123,286 @@ class VLA_JEPA(baseframework):
         )
 
         self.embodied_replace_prompt = "".join([embodied_action_token * self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction])
+
+        # Delta-JEPA: control-aware latent displacement + inference-time verifier support
+        delta_cfg = self.config.framework.get("delta_jepa", {})
+        self.use_delta_jepa = bool(delta_cfg.get("enabled", False))
+        self.delta_jepa_blend_vlm_tokens = bool(delta_cfg.get("blend_vlm_tokens", True))
+        self.lambda_wm = float(delta_cfg.get("lambda_wm", 0.1))
+        self.lambda_delta = float(delta_cfg.get("lambda_delta", 0.05))
+        self.lambda_ctrl = float(delta_cfg.get("lambda_ctrl", 0.02))
+        self.ctrl_action_step = delta_cfg.get("ctrl_action_step", "first")
+        self.verifier_num_candidates = int(delta_cfg.get("verifier_num_candidates", 8))
+        self.use_verifier_default = bool(delta_cfg.get("use_verifier", False))
+        self.subgoal_tracking_mode = delta_cfg.get("subgoal_tracking_mode", "sequential")
+        self.subgoal_epsilon = float(delta_cfg.get("subgoal_epsilon", 0.15))
+        self.subgoals_path = delta_cfg.get("subgoals_path", None)
+
+        self.num_temporal_frames = self.config.framework.vj2_model.num_frames // tubelet_size
+        self.num_predictor_action_tokens = max(
+            1,
+            (self.num_temporal_frames - 1)
+            * self.config.framework.vj2_model.num_action_tokens_per_timestep,
+        )
+
+        if self.use_delta_jepa:
+            vlm_hidden_dim = self.qwen_vl_interface.model.config.hidden_size
+            action_dim = self.config.framework.action_model.action_dim
+            state_dim = self.config.framework.action_model.state_dim
+            jepa_embed_dim = self.vj_encoder.config.hidden_size * self.num_video_views
+            hidden_dim = int(delta_cfg.get("hidden_dim", 512))
+
+            self.candidate_action_encoder = CandidateActionEncoder(
+                action_dim=action_dim,
+                hidden_dim=hidden_dim,
+                output_dim=vlm_hidden_dim,
+                num_output_tokens=self.num_predictor_action_tokens,
+            )
+            self.inv_dyn_decoder = LatentInverseDynamics(
+                latent_dim=jepa_embed_dim,
+                state_dim=state_dim,
+                action_dim=action_dim,
+                hidden_dim=hidden_dim,
+            )
+            logger.info(
+                "Delta-JEPA enabled: lambda_wm=%s lambda_delta=%s lambda_ctrl=%s",
+                self.lambda_wm,
+                self.lambda_delta,
+                self.lambda_ctrl,
+            )
+        else:
+            self.candidate_action_encoder = None
+            self.inv_dyn_decoder = None
+
+        self.subgoal_tracker: Optional[SubgoalTracker] = None
+        if self.subgoals_path:
+            self.load_subgoal_tracker(self.subgoals_path, precompute_latents=False)
+
+    def _encode_subgoal_batch(self, goal_images: List[Image.Image]) -> torch.Tensor:
+        """Encode a list of subgoal images into pooled latents [M, D]."""
+        goal_embeddings = self._encode_goal_images(goal_images)
+        return goal_embeddings
+
+    def load_subgoal_tracker(self, subgoals_path: str, precompute_latents: bool = True) -> None:
+        """Load demo-derived subgoals for online tracking."""
+        self.subgoals_path = subgoals_path
+        encode_fn = self._encode_subgoal_batch if precompute_latents else None
+        self.subgoal_tracker = SubgoalTracker.from_path(
+            subgoals_path,
+            mode=self.subgoal_tracking_mode,
+            epsilon=self.subgoal_epsilon,
+            encode_fn=encode_fn,
+        )
+        logger.info(
+            "Loaded %s subgoals from %s (mode=%s)",
+            self.subgoal_tracker.num_subgoals,
+            subgoals_path,
+            self.subgoal_tracking_mode,
+        )
+
+    def reset_subgoal_tracker(self) -> None:
+        if self.subgoal_tracker is not None:
+            self.subgoal_tracker.reset()
+
+    def _get_delta_jepa_action_target(self, actions_target: torch.Tensor) -> torch.Tensor:
+        """Pick the action label used by inverse-dynamics supervision."""
+        if self.ctrl_action_step == "mean":
+            return actions_target.mean(dim=1)
+        if self.ctrl_action_step == "last":
+            return actions_target[:, -1, :]
+        return actions_target[:, 0, :]
+
+    def _build_predictor_action_cond(
+        self,
+        action_tokens: torch.Tensor,
+        actions_target: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Build predictor conditioning tokens (VLM tokens, action chunks, or both)."""
+        if not self.use_delta_jepa or actions_target is None:
+            return action_tokens
+
+        action_encoder_param = next(self.candidate_action_encoder.parameters())
+        actions_target = actions_target.to(
+            device=action_encoder_param.device,
+            dtype=action_encoder_param.dtype,
+        )
+        candidate_cond = self.candidate_action_encoder(actions_target)
+        if candidate_cond.shape[1] != action_tokens.shape[1]:
+            candidate_cond = F.interpolate(
+                candidate_cond.transpose(1, 2),
+                size=action_tokens.shape[1],
+                mode="linear",
+                align_corners=False,
+            ).transpose(1, 2)
+
+        if self.delta_jepa_blend_vlm_tokens:
+            return action_tokens + candidate_cond
+        return candidate_cond
+
+    def _compute_delta_jepa_losses(
+        self,
+        input_states: torch.Tensor,
+        gt_states: torch.Tensor,
+        predicted_states: torch.Tensor,
+        actions_target: torch.Tensor,
+        state: Optional[torch.Tensor],
+        tokens_per_frame: int,
+    ) -> dict:
+        """Delta-JEPA displacement + control-aware inverse dynamics losses."""
+        z_t = pool_last_temporal_frame(input_states, tokens_per_frame)
+        z_tk = pool_vjepa_tokens(gt_states)
+        delta_z_gt = z_tk - z_t
+
+        z_hat = pool_vjepa_tokens(predicted_states)
+        delta_z_pred = z_hat - z_t.detach()
+
+        delta_loss = F.mse_loss(delta_z_pred, delta_z_gt.detach())
+
+        if state is None:
+            ctrl_loss = torch.zeros((), device=predicted_states.device, dtype=predicted_states.dtype)
+        else:
+            if state.dim() == 2:
+                state = state.unsqueeze(1)
+            a_gt = self._get_delta_jepa_action_target(actions_target)
+            a_hat_gt = self.inv_dyn_decoder(delta_z_gt.detach(), state)
+            a_hat_pred = self.inv_dyn_decoder(delta_z_pred, state)
+            ctrl_loss = F.mse_loss(a_hat_gt, a_gt) + F.mse_loss(a_hat_pred, a_gt)
+
+        return {"delta_loss": delta_loss, "ctrl_loss": ctrl_loss}
+
+    def _encode_video_batch(self, batch_videos: np.ndarray) -> torch.Tensor:
+        """Encode a numpy video batch with the frozen V-JEPA encoder. Returns [B, N, D]."""
+        batch_videos = batch_videos.transpose(0, 1, 2, 5, 3, 4)  # [B, V, T, 3, H, W]
+        bsz, num_views, num_frames, channels, height, width = batch_videos.shape
+        flat_videos = batch_videos.reshape(bsz * num_views, num_frames, channels, height, width)
+        input_videos = self.vj_processor(
+            videos=[flat_videos[i] for i in range(flat_videos.shape[0])],
+            return_tensors="pt",
+        )["pixel_values_videos"]
+        encoder_param = next(self.vj_encoder.parameters())
+        input_videos = input_videos.to(
+            device=encoder_param.device,
+            dtype=encoder_param.dtype,
+        )
+        use_cuda_autocast = (
+            encoder_param.is_cuda
+            and encoder_param.dtype in (torch.float16, torch.bfloat16)
+        )
+        with torch.no_grad(), torch.autocast(
+            device_type="cuda",
+            dtype=encoder_param.dtype,
+            enabled=use_cuda_autocast,
+        ):
+            video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
+            if num_views > 1:
+                video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=num_views, dim=0), dim=2)
+        return video_embeddings
+
+    def _images_to_video_batch(
+        self,
+        batch_images: List[List[Image.Image]],
+        num_frames: Optional[int] = None,
+    ) -> np.ndarray:
+        """Convert current images into a short video clip by repeating frames."""
+        num_frames = num_frames or self.config.framework.vj2_model.num_frames
+        videos = []
+        for sample_images in batch_images:
+            frame = np.array(sample_images[0]).astype(np.uint8)
+            view_video = np.stack([frame] * num_frames, axis=0)  # [T, H, W, 3]
+            videos.append(view_video[None, ...])  # [1, T, H, W, 3]
+        return np.stack(videos, axis=0)  # [B, 1, T, H, W, 3]
+
+    def _encode_goal_images(self, goal_images: List[Image.Image]) -> torch.Tensor:
+        """Encode subgoal images into pooled JEPA latents. Returns [B, D]."""
+        goal_batch = self._images_to_video_batch([[img] for img in goal_images])
+        goal_embeddings = self._encode_video_batch(goal_batch)
+        tokens_per_frame = max(1, goal_embeddings.shape[1] // self.num_temporal_frames)
+        return pool_vjepa_tokens(goal_embeddings[:, -tokens_per_frame:, :])
+
+    def _predict_future_latent(
+        self,
+        video_embeddings: torch.Tensor,
+        action_cond: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run predictor and return (input_states, gt_states, predicted_states)."""
+        num_temporal = self.num_temporal_frames
+        tokens_per_step = video_embeddings.shape[1] // num_temporal
+        input_states = video_embeddings[:, :-tokens_per_step, :]
+        gt_states = video_embeddings[:, tokens_per_step:, :]
+        predictor_param = next(self.vj_predictor.parameters())
+        input_states = input_states.to(
+            device=predictor_param.device,
+            dtype=predictor_param.dtype,
+        )
+        action_cond = action_cond.to(
+            device=predictor_param.device,
+            dtype=predictor_param.dtype,
+        )
+        use_cuda_autocast = (
+            predictor_param.is_cuda
+            and predictor_param.dtype in (torch.float16, torch.bfloat16)
+        )
+        with torch.autocast(
+            device_type="cuda",
+            dtype=predictor_param.dtype,
+            enabled=use_cuda_autocast,
+        ):
+            predicted_states = self.vj_predictor(input_states, action_cond)
+        return input_states, gt_states, predicted_states
+
+    def _get_vlm_action_tokens(
+        self,
+        batch_images: List[List[Image.Image]],
+        instructions: List[str],
+        include_embodied: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images,
+            instructions=instructions,
+            prompt_replace_dict={
+                "{actions}": self.replace_prompt,
+                "{e_actions}": self.embodied_replace_prompt,
+            },
+            prompt_template=self.config.datasets.vla_data.get("CoT_prompt", ""),
+        )
+        action_indices = torch.isin(
+            qwen_inputs["input_ids"],
+            torch.tensor(self.action_token_ids, device=qwen_inputs["input_ids"].device),
+        ).nonzero(as_tuple=True)
+        embodied_action_indices = torch.isin(
+            qwen_inputs["input_ids"],
+            torch.tensor([self.embodied_action_token_id], device=qwen_inputs["input_ids"].device),
+        ).nonzero(as_tuple=True)
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            qwenvl_outputs = self.qwen_vl_interface(
+                **qwen_inputs,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            last_hidden = qwenvl_outputs.hidden_states[-1]
+            batch_size = last_hidden.shape[0]
+            action_tokens = last_hidden[action_indices[0], action_indices[1], :].view(batch_size, -1, last_hidden.shape[-1])
+            embodied_action_tokens = None
+            if include_embodied:
+                embodied_action_tokens = last_hidden[
+                    embodied_action_indices[0], embodied_action_indices[1], :
+                ].view(batch_size, -1, last_hidden.shape[-1])
+        return action_tokens, embodied_action_tokens
+
+    def sample_action_candidates(
+        self,
+        embodied_action_tokens: torch.Tensor,
+        state: Optional[torch.Tensor],
+        num_candidates: int,
+    ) -> torch.Tensor:
+        """Sample multiple action chunks from the flow-matching head."""
+        candidates = []
+        with torch.autocast("cuda", dtype=torch.float32):
+            for _ in range(num_candidates):
+                candidates.append(self.action_model.predict_action(embodied_action_tokens, state))
+        return torch.stack(candidates, dim=1)  # [B, N, T, action_dim]
 
     def expand_tokenizer(self, 
                          tokenizer: AutoTokenizer,
@@ -242,13 +530,24 @@ class VLA_JEPA(baseframework):
         
             # Step 3: VJ Predictor
             T = T // self.vj_encoder.config.tubelet_size
-            input_states = video_embeddings[:, :video_embeddings.shape[1] // T * (T-1),:]  # [B, (T-1)*dim_per_frame, V*embed_dim]
-            gt_states = video_embeddings[:, video_embeddings.shape[1] // T:, :]
-            #print(input_states.shape, action_tokens.shape)
-            #exit()
+            tokens_per_step = video_embeddings.shape[1] // T
+            input_states = video_embeddings[:, :-tokens_per_step, :]
+            gt_states = video_embeddings[:, tokens_per_step:, :]
+
+            action_cond = action_tokens
+            actions_tensor = None
+            if actions is not None and self.use_delta_jepa:
+                actions_tensor = torch.tensor(
+                    np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
+                )
+                actions_target_for_predictor = actions_tensor[
+                    :, -(self.future_action_window_size + 1) :, :
+                ]
+                action_cond = self._build_predictor_action_cond(action_tokens, actions_target_for_predictor)
+
             predicted_states = self.vj_predictor(
                 input_states,
-                action_tokens
+                action_cond
             )
 
             teacher_forcing_wm_loss = F.l1_loss(
@@ -258,15 +557,17 @@ class VLA_JEPA(baseframework):
             )
         
         if "action" not in examples[0]:
-            return {"wm_loss": teacher_forcing_wm_loss}
+            wm_weight = self.lambda_wm if self.use_delta_jepa else 1.0
+            return {"wm_loss": teacher_forcing_wm_loss * wm_weight}
 
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
             # 标签对齐：取最后 chunk_len 段
-            actions = torch.tensor(
-                np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
-            )  # [B, T_full, action_dim]
-            actions_target = actions[:, -(self.future_action_window_size+1):, :]  # (B, chunk_len, action_dim)
+            if actions_tensor is None:
+                actions_tensor = torch.tensor(
+                    np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
+                )
+            actions_target = actions_tensor[:, -(self.future_action_window_size+1):, :]  # (B, chunk_len, action_dim)
 
             repeated_diffusion_steps = (
                 self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
@@ -275,18 +576,34 @@ class VLA_JEPA(baseframework):
             embodied_action_repeated = embodied_action_tokens.repeat(repeated_diffusion_steps, 1, 1)
             
             state_repeated = None
+            state_tensor = None
             if state is not None:
-                state = torch.tensor(
+                state_tensor = torch.tensor(
                     np.array(state), device=last_hidden.device, dtype=last_hidden.dtype
                 )
-                #print(state.shape)
-                state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
+                state_repeated = state_tensor.repeat(repeated_diffusion_steps, 1, 1)
 
-            #print(embodied_action_repeated.shape, actions_target_repeated.shape, state_repeated.shape) if state_repeated is not None else print("No state for action model")
-            #exit()
-            action_loss = self.action_model(embodied_action_repeated, actions_target_repeated, state_repeated)  # (B, chunk_len, action_dim)
+            action_loss = self.action_model(embodied_action_repeated, actions_target_repeated, state_repeated)
 
-        return {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss * 0.1}
+        wm_weight = self.lambda_wm if self.use_delta_jepa else 0.1
+        output = {
+            "action_loss": action_loss,
+            "wm_loss": teacher_forcing_wm_loss * wm_weight,
+        }
+
+        if self.use_delta_jepa:
+            delta_losses = self._compute_delta_jepa_losses(
+                input_states=input_states,
+                gt_states=gt_states,
+                predicted_states=predicted_states,
+                actions_target=actions_target,
+                state=state_tensor,
+                tokens_per_frame=tokens_per_step,
+            )
+            output["delta_loss"] = delta_losses["delta_loss"] * self.lambda_delta
+            output["ctrl_loss"] = delta_losses["ctrl_loss"] * self.lambda_ctrl
+
+        return output
 
     @torch.inference_mode()
     def predict_action(
@@ -294,28 +611,29 @@ class VLA_JEPA(baseframework):
         batch_images: List[List[Image.Image]],  # Batch of PIL Image list as [view1, view2]
         instructions: List[str],
         state: Optional[np.ndarray] = None,
-        **kwargs: str,
-    ) -> np.ndarray:
+        use_verifier: Optional[bool] = None,
+        reset_subgoals: bool = False,
+        num_candidates: Optional[int] = None,
+        subgoal_images: Optional[List[Image.Image]] = None,
+        **kwargs,
+    ) -> dict:
         """
-        推理：单次前向直接回归未来动作（无扩散采样）。
-
-        Steps:
-          1. Resize images to training resolution (if specified)
-          2. Encode with QwenVL (hidden states retained)
-          6. Return normalized action trajectory
-
-        Args:
-            batch_images: List of samples; each sample is List[PIL.Image] (multi-view).
-            instructions: List[str] natural language task instructions.
-            cfg_scale: >1 enables classifier-free guidance (scales conditional vs unconditional).
-            use_ddim: Whether to use DDIM deterministic sampling.
-            num_ddim_steps: Number of DDIM steps if enabled.
-            **kwargs: Reserved.
-
-        Returns:
-            dict:
-                normalized_actions (np.ndarray): Shape [B, T, action_dim], diffusion-sampled normalized actions.
+        Predict actions. When verifier mode is enabled, runs best-of-N latent verification.
         """
+        if reset_subgoals:
+            self.reset_subgoal_tracker()
+
+        should_verify = self.use_verifier_default if use_verifier is None else bool(use_verifier)
+        if should_verify and self.use_delta_jepa:
+            return self.predict_action_verified(
+                batch_images=batch_images,
+                instructions=instructions,
+                state=state,
+                subgoal_images=subgoal_images,
+                num_candidates=num_candidates,
+                **kwargs,
+            )
+
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
@@ -349,6 +667,89 @@ class VLA_JEPA(baseframework):
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions, "embodied_action_tokens": embodied_action_tokens.to(dtype=torch.float32).detach().cpu().numpy()}
+
+    @torch.inference_mode()
+    def predict_action_verified(
+        self,
+        batch_images: List[List[Image.Image]],
+        instructions: List[str],
+        state: Optional[np.ndarray] = None,
+        subgoal_images: Optional[List[Image.Image]] = None,
+        num_candidates: Optional[int] = None,
+        **kwargs,
+    ) -> dict:
+        """
+        Best-of-N inference with JEPA latent action verification.
+
+        Samples multiple candidate action chunks, rolls each forward in latent space,
+        and selects the candidate with the best predicted progress toward the subgoal.
+        """
+        if not self.use_delta_jepa:
+            raise RuntimeError("predict_action_verified requires framework.delta_jepa.enabled=true")
+
+        train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
+        if train_obs_image_size:
+            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+
+        num_candidates = num_candidates or self.verifier_num_candidates
+        video_batch = self._images_to_video_batch(batch_images)
+        video_embeddings = self._encode_video_batch(video_batch)
+        tokens_per_frame = max(1, video_embeddings.shape[1] // self.num_temporal_frames)
+        z_current = pool_last_temporal_frame(video_embeddings, tokens_per_frame)
+
+        if self.subgoal_tracker is not None:
+            self.subgoal_tracker.maybe_precompute_latents(self._encode_subgoal_batch)
+            self.subgoal_tracker.update(z_current[0] if z_current.shape[0] == 1 else z_current)
+            subgoal_images = self.subgoal_tracker.current_subgoal_images(len(batch_images))
+        elif subgoal_images is None:
+            raise ValueError(
+                "subgoal_images is required unless framework.delta_jepa.subgoals_path is configured"
+            )
+
+        action_tokens, embodied_action_tokens = self._get_vlm_action_tokens(
+            batch_images=batch_images,
+            instructions=instructions,
+            include_embodied=True,
+        )
+
+        state_tensor = (
+            torch.from_numpy(np.array(state)).to(embodied_action_tokens.device, dtype=embodied_action_tokens.dtype)
+            if state is not None
+            else None
+        )
+
+        candidates = self.sample_action_candidates(
+            embodied_action_tokens=embodied_action_tokens,
+            state=state_tensor,
+            num_candidates=num_candidates,
+        )
+
+        z_goal = self._encode_goal_images(subgoal_images)
+
+        best_scores = torch.full((candidates.shape[0],), -1e9, device=candidates.device)
+        best_actions = candidates[:, 0]
+
+        for idx in range(num_candidates):
+            candidate_chunk = candidates[:, idx]
+            candidate_cond = self._build_predictor_action_cond(action_tokens, candidate_chunk)
+            _, _, predicted_states = self._predict_future_latent(video_embeddings, candidate_cond)
+            z_predicted = pool_vjepa_tokens(predicted_states)
+            scores = latent_progress_score(z_current, z_predicted, z_goal)
+            better = scores > best_scores
+            best_scores = torch.where(better, scores, best_scores)
+            best_actions = torch.where(better.unsqueeze(-1).unsqueeze(-1), candidate_chunk, best_actions)
+
+        return {
+            "normalized_actions": best_actions.detach().cpu().numpy(),
+            "verification_scores": best_scores.detach().cpu().numpy(),
+            "all_candidates": candidates.detach().cpu().numpy(),
+            "subgoal_index": (
+                self.subgoal_tracker.current_index if self.subgoal_tracker is not None else None
+            ),
+            "subgoal_state": (
+                self.subgoal_tracker.state_dict() if self.subgoal_tracker is not None else None
+            ),
+        }
 
 
 

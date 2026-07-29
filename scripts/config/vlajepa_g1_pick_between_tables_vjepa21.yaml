@@ -1,4 +1,4 @@
-run_id: g1_pick_between_tables_ft
+run_id: g1_pick_between_tables_vjepa21
 run_root_dir: checkpoints
 seed: 42
 trackers:
@@ -41,7 +41,9 @@ framework:
       output_dim: 1024
       positional_embeddings: null
   vj2_model:
-    base_encoder: /cpfs_infra/shared/xiaoxinyu/VLA-JEPA/VLA-JEPA-DEV/vjepa2-vitl-fpc64-256
+    base_encoder: /cpfs_infra/shared/xiaoxinyu/VLA-JEPA/VLA-JEPA-DEV/vjepa2_1_vitl_dist_vitG_384.pt
+    arch: vit_large
+    image_size: 384
     num_video_views: 1
     depth: 12
     num_heads: 8
@@ -59,10 +61,10 @@ framework:
     ctrl_action_step: first
     hidden_dim: 512
     verifier_num_candidates: 8
-    use_verifier: false
+    use_verifier: true
     subgoal_tracking_mode: sequential
     subgoal_epsilon: 0.15
-    subgoals_path: null
+    subgoals_path: /home/d024/datasets/psi-data/subgoals/pick_between_tables_simple_ep0_jepa21_384_change
   reduce_in_full_precision: true
 
 
@@ -76,7 +78,7 @@ datasets:
     resolution_size: 224
     image_size: [224, 224]
     per_device_batch_size: 32
-    video_resolution_size: 256
+    video_resolution_size: 384
     load_all_data_for_training: true
     with_state: true
     delete_pause_frame: false

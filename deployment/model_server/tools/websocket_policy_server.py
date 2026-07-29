@@ -92,6 +92,28 @@ class WebsocketPolicyServer:
         if mtype == "ping":
             return {"status": "ok", "ok": True, "type": "ping", "request_id": req_id}
 
+        # reset
+        elif mtype == "reset":
+            try:
+                if hasattr(self._policy, "reset_subgoal_tracker"):
+                    self._policy.reset_subgoal_tracker()
+                return {
+                    "status": "ok",
+                    "ok": True,
+                    "type": "reset_result",
+                    "request_id": req_id,
+                    "data": {"reset": True},
+                }
+            except Exception as e:
+                logging.exception("Policy reset error (request_id=%s)", req_id)
+                return {
+                    "status": "error",
+                    "ok": False,
+                    "type": "reset_result",
+                    "request_id": req_id,
+                    "error": {"message": str(e)},
+                }
+
         # infer
         elif mtype == "infer":
             # Basic payload sanity
