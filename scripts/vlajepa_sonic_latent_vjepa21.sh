@@ -24,7 +24,7 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_TIMEOUT=1000
 export TMPDIR=/tmp
 export FFMPEG_THREADS=1
-export OMP_NUM_THREADS=1
+export OMP_NUM_THREADS=8
 
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_ENTITY="${WANDB_ENTITY:-xinyu-xiao-kinetix-ai}"

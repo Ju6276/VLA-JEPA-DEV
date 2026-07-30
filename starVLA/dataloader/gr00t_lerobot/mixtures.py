@@ -87,6 +87,14 @@ DATASET_NAMED_MIXTURES = {
         ("dataset/G1WholebodyLocomotionPickBetweenTablesTeleop-v0", 1.0, "g1_pick_between_tables"),
     ],
 
+    "g1_pick_between_tables_75eps": [
+        ("dataset/G1WholebodyLocomotionPickBetweenTablesTeleop-v0-75eps", 1.0, "g1_pick_between_tables"),
+    ],
+
+    "g1_pick_between_tables_50eps": [
+        ("dataset/G1WholebodyLocomotionPickBetweenTablesTeleop-v0-50eps", 1.0, "g1_pick_between_tables"),
+    ],
+
     "g1_pick_hug_container": [
         ("dataset/G1WholebodyPickAndPlaceAndHugContainerTeleop-v0", 1.0, "g1_pick_hug_container"),
     ],
@@ -101,6 +109,22 @@ DATASET_NAMED_MIXTURES = {
 
     "g1_open_trash_can": [
         ("dataset/G1WholebodyOpenTrashCanTeleop-v0", 1.0, "g1_open_trash_can"),
+    ],
+
+    "g1_xmove_pick": [
+        ("dataset/simple/G1WholebodyXMovePickTeleop-v0", 1.0, "g1_xmove_pick"),
+    ],
+
+    "g1_xmove_bend_pick": [
+        ("dataset/simple/G1WholebodyXMoveBendPickTeleop-v0", 1.0, "g1_xmove_bend_pick"),
+    ],
+
+    "g1_tabletop_grasp": [
+        ("dataset/simple/G1WholebodyTabletopGraspMP-v0", 1.0, "g1_tabletop_grasp"),
+    ],
+
+    "g1_bend_pick": [
+        ("dataset/simple/G1WholebodyBendPickMP-v0", 1.0, "g1_bend_pick"),
     ],
 
 }

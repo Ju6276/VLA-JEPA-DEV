@@ -1,4 +1,4 @@
-run_id: g1_pick_between_tables_vjepa21_ft_temp
+run_id: g1_bend_pick_vjepa21_ft
 run_root_dir: checkpoints
 seed: 42
 trackers:
@@ -59,7 +59,7 @@ datasets:
   vla_data:
     dataset_py: lerobot_datasets
     data_root_dir: /cpfs_infra/shared/xiaoxinyu/VLA-JEPA/VLA-JEPA-DEV
-    data_mix: g1_pick_between_tables
+    data_mix: g1_bend_pick
     action_type: joint
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
     resolution_size: 224

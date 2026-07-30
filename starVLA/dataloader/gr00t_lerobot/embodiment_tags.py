@@ -87,6 +87,26 @@ class EmbodimentTag(Enum):
     The G1 wholebody open trash can teleop dataset.
     """
 
+    G1_XMOVE_PICK = "g1_xmove_pick"
+    """
+    The G1 wholebody X-move pick teleop dataset.
+    """
+
+    G1_XMOVE_BEND_PICK = "g1_xmove_bend_pick"
+    """
+    The G1 wholebody X-move bend pick teleop dataset.
+    """
+
+    G1_TABLETOP_GRASP = "g1_tabletop_grasp"
+    """
+    The G1 wholebody tabletop grasp MP dataset.
+    """
+
+    G1_BEND_PICK = "g1_bend_pick"
+    """
+    The G1 wholebody bend pick MP dataset.
+    """
+
     GARBAGE = "garbage"
     """
     The Sonic garbage-bin task dataset (all_merged).
@@ -108,6 +128,10 @@ EMBODIMENT_TAG_MAPPING = {
     EmbodimentTag.G1_OPEN_OVEN.value: 21,
     EmbodimentTag.G1_OPEN_FAUCET.value: 22,
     EmbodimentTag.G1_OPEN_TRASH_CAN.value: 23,
+    EmbodimentTag.G1_XMOVE_PICK.value: 16,
+    EmbodimentTag.G1_XMOVE_BEND_PICK.value: 15,
+    EmbodimentTag.G1_TABLETOP_GRASP.value: 14,
+    EmbodimentTag.G1_BEND_PICK.value: 13,
     EmbodimentTag.GARBAGE.value: 30,
 }
 
@@ -127,4 +151,8 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     "g1_open_oven": EmbodimentTag.G1_OPEN_OVEN,
     "g1_open_faucet": EmbodimentTag.G1_OPEN_FAUCET,
     "g1_open_trash_can": EmbodimentTag.G1_OPEN_TRASH_CAN,
+    "g1_xmove_pick": EmbodimentTag.G1_XMOVE_PICK,
+    "g1_xmove_bend_pick": EmbodimentTag.G1_XMOVE_BEND_PICK,
+    "g1_tabletop_grasp": EmbodimentTag.G1_TABLETOP_GRASP,
+    "g1_bend_pick": EmbodimentTag.G1_BEND_PICK,
 }

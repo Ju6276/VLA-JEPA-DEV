@@ -7,7 +7,7 @@ export NCCL_TIMEOUT=1000  # timeout set to 1 hour (unit: seconds)
 #export NCCL_DEBUG=INFO
 #export NCCL_DEBUG_SUBSYS=ALL
 export FFMPEG_THREADS=1
-export OMP_NUM_THREADS=1
+export OMP_NUM_THREADS=8
 
 export WANDB_MODE=online
 export WANDB_ENTITY="${WANDB_ENTITY:-ju-dong6276-technical-university-of-munich}"

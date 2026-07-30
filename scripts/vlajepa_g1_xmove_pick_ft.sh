@@ -1,7 +1,7 @@
 #!/bin/bash
-# G1 open oven fine-tuning with V-JEPA 2.1 ViT-L/384 (weights under VJEPA21/).
+# G1 X-move pick fine-tuning with V-JEPA 2.1 ViT-L/384 (weights under VJEPA21/).
 # NOTE: DLC 默认使用 /bin/sh，不支持 source。请用 bash 运行本脚本：
-#   bash scripts/vlajepa_g1_open_oven_ft.sh
+#   bash scripts/vlajepa_g1_xmove_pick_ft.sh
 
 set -e
 
@@ -32,12 +32,13 @@ export OMP_NUM_THREADS=8
 # Default 8 GPUs; override with NUM_PROCESSES=N if needed
 NUM_PROCESSES="${NUM_PROCESSES:-8}"
 echo "Using NUM_PROCESSES=${NUM_PROCESSES}"
-echo "Config: scripts/config/vlajepa_g1_open_oven_ft.yaml (V-JEPA 2.1, 384px)"
+echo "Config: scripts/config/vlajepa_g1_xmove_pick_ft.yaml (V-JEPA 2.1, 384px)"
 echo "Encoder: VJEPA21/vjepa2_1_vitl_dist_vitG_384.pt"
-echo "Output: checkpoints/g1_open_oven_vjepa21_ft"
+echo "Dataset: dataset/simple/G1WholebodyXMovePickTeleop-v0"
+echo "Output: checkpoints/g1_xmove_pick_vjepa21_ft"
 
 accelerate launch \
   --config_file ./starVLA/config/deepseeds/deepspeed_zero2.yaml \
   --num_processes "${NUM_PROCESSES}" \
   ./starVLA/training/train_starvla.py \
-  --config_yaml ./scripts/config/vlajepa_g1_open_oven_ft.yaml
+  --config_yaml ./scripts/config/vlajepa_g1_xmove_pick_ft.yaml

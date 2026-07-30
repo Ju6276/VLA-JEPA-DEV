@@ -1,11 +1,14 @@
-run_id: g1_pick_between_tables_vjepa21_ft_temp
+# Continue all_merged fine-tune from steps_70000 for another 20k steps.
+# Loads model weights only (optimizer / LR / step counter restart from 0).
+# Output goes to checkpoints/all_merged_vjepa21_ft_from70k/ to avoid overwriting the original run.
+run_id: all_merged_vjepa21_ft_from70k
 run_root_dir: checkpoints
 seed: 42
 trackers:
 - json
 - wandb
 wandb_entity: xinyu-xiao-kinetix-ai
-wandb_project: VLA_JEPA21_SIMPLE
+wandb_project: VLA_JEPA_garbage_vjepa21
 is_debug: false
 framework:
   name: VLA_JEPA
@@ -19,10 +22,10 @@ framework:
     hidden_size: 1024
     add_pos_embed: true
     max_seq_len: 1024
-    action_dim: 36
-    state_dim: 32
-    future_action_window_size: 29
-    action_horizon: 30
+    action_dim: 78
+    state_dim: 46
+    future_action_window_size: 39
+    action_horizon: 40
     past_action_window_size: 0
     repeated_diffusion_steps: 8
     noise_beta_alpha: 1.5
@@ -58,12 +61,11 @@ framework:
 datasets:
   vla_data:
     dataset_py: lerobot_datasets
-    data_root_dir: /cpfs_infra/shared/xiaoxinyu/VLA-JEPA/VLA-JEPA-DEV
-    data_mix: g1_pick_between_tables
-    action_type: joint
+    data_root_dir: /cpfs_infra/shared/xiaoxinyu/VLA-JEPA/VLA-JEPA-DEV/dataset
+    data_mix: garbage
+    action_type: motion_token
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
     resolution_size: 224
-    image_size: [224, 224]
     per_device_batch_size: 32
     video_resolution_size: 384
     load_all_data_for_training: true
@@ -76,15 +78,15 @@ datasets:
 
 trainer:
   epochs: 100
-  max_train_steps: 40000
-  num_warmup_steps: 2000
+  max_train_steps: 20000
+  num_warmup_steps: 0
   save_interval: 10000
   eval_interval: 500
-  pretrained_checkpoint: null
+  pretrained_checkpoint: /cpfs_infra/shared/xiaoxinyu/VLA-JEPA/VLA-JEPA-DEV/checkpoints/all_merged_vjepa21_ft/checkpoints/steps_70000_pytorch_model.pt
   learning_rate:
-    base: 3.0e-05
-    qwen_vl_interface: 1.0e-05
-    action_model: 1.0e-04
+    base: 1.5e-05
+    qwen_vl_interface: 5.0e-06
+    action_model: 5.0e-05
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
