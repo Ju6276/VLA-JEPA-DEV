@@ -1,0 +1,15 @@
+policy_name: starVLA
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+# instruction_type: unseen
+instruction_type: seen
+# StarVLA Client Parameters
+host: "127.0.0.1"
+port: 6694
+policy_ckpt_path: null
+unnorm_key: null
+replan_steps: null
+action_ensemble: null
+action_ensemble_alpha: null

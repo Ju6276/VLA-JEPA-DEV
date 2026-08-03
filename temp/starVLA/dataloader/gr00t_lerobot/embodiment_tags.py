@@ -1,0 +1,144 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from enum import Enum
+
+
+class EmbodimentTag(Enum):
+    GR1 = "gr1"
+    """
+    The GR1 dataset.
+    """
+
+    OXE_DROID = "oxe_droid"
+    """
+    The OxE Droid dataset.
+    """
+
+    OXE_BRIDGE = "oxe_bridge"
+    """
+    The OxE Bridge dataset.
+    """
+
+    OXE_RT1 = "oxe_rt1"
+    """
+    The OxE RT-1 dataset.
+    """
+
+    AGIBOT_GENIE1 = "agibot_genie1"
+    """
+    The AgiBot Genie-1 with gripper dataset.
+    """
+
+    NEW_EMBODIMENT = "new_embodiment"
+    """
+    Any new embodiment for finetuning.
+    """
+
+    FRANKA = 'franka'
+    """
+    The Franka Emika Panda robot.
+    """
+
+    SONIC_HUMANOID = "sonic_humanoid"
+    """
+    The NVIDIA Sonic humanoid robot.
+    """
+
+    G1_HANDOVER = "g1_handover"
+    """
+    The G1 wholebody handover teleop dataset.
+    """
+
+    G1_PICK_BETWEEN_TABLES = "g1_pick_between_tables"
+    """
+    The G1 wholebody locomotion pick between tables teleop dataset.
+    """
+
+    G1_PICK_HUG_CONTAINER = "g1_pick_hug_container"
+    """
+    The G1 wholebody pick-and-place and hug container teleop dataset.
+    """
+
+    G1_OPEN_OVEN = "g1_open_oven"
+    """
+    The G1 wholebody open oven teleop dataset.
+    """
+
+    G1_OPEN_FAUCET = "g1_open_faucet"
+    """
+    The G1 wholebody open faucet teleop dataset.
+    """
+
+    G1_OPEN_TRASH_CAN = "g1_open_trash_can"
+    """
+    The G1 wholebody open trash can teleop dataset.
+    """
+
+    G1_XMOVE_PICK = "g1_xmove_pick"
+    """
+    The G1 wholebody X-move pick teleop dataset.
+    """
+
+    G1_XMOVE_BEND_PICK = "g1_xmove_bend_pick"
+    """
+    The G1 wholebody X-move bend pick teleop dataset.
+    """
+
+    GARBAGE = "garbage"
+    """
+    The Sonic garbage-bin task dataset (all_merged).
+    """
+
+# Embodiment tag string: to projector index in the Action Expert Module
+EMBODIMENT_TAG_MAPPING = {
+    EmbodimentTag.NEW_EMBODIMENT.value: 31,
+    EmbodimentTag.OXE_DROID.value: 17,
+    EmbodimentTag.OXE_BRIDGE.value: 18,
+    EmbodimentTag.OXE_RT1.value: 19,
+    EmbodimentTag.AGIBOT_GENIE1.value: 26,
+    EmbodimentTag.GR1.value: 24,
+    EmbodimentTag.FRANKA.value: 25,
+    EmbodimentTag.SONIC_HUMANOID.value: 27,
+    EmbodimentTag.G1_HANDOVER.value: 28,
+    EmbodimentTag.G1_PICK_BETWEEN_TABLES.value: 29,
+    EmbodimentTag.G1_PICK_HUG_CONTAINER.value: 20,
+    EmbodimentTag.G1_OPEN_OVEN.value: 21,
+    EmbodimentTag.G1_OPEN_FAUCET.value: 22,
+    EmbodimentTag.G1_OPEN_TRASH_CAN.value: 23,
+    EmbodimentTag.G1_XMOVE_PICK.value: 16,
+    EmbodimentTag.G1_XMOVE_BEND_PICK.value: 15,
+    EmbodimentTag.GARBAGE.value: 30,
+}
+
+# Robot type to embodiment tag mapping
+ROBOT_TYPE_TO_EMBODIMENT_TAG = {
+    "libero_franka": EmbodimentTag.FRANKA,
+    "oxe_droid": EmbodimentTag.OXE_DROID,
+    "oxe_bridge": EmbodimentTag.OXE_BRIDGE,
+    "oxe_rt1": EmbodimentTag.OXE_RT1,
+    "demo_sim_franka_delta_joints": EmbodimentTag.FRANKA,
+    "custom_robot_config": EmbodimentTag.NEW_EMBODIMENT,
+    "sonic_latent_humanoid": EmbodimentTag.SONIC_HUMANOID,
+    "garbage": EmbodimentTag.GARBAGE,
+    "g1_handover": EmbodimentTag.G1_HANDOVER,
+    "g1_pick_between_tables": EmbodimentTag.G1_PICK_BETWEEN_TABLES,
+    "g1_pick_hug_container": EmbodimentTag.G1_PICK_HUG_CONTAINER,
+    "g1_open_oven": EmbodimentTag.G1_OPEN_OVEN,
+    "g1_open_faucet": EmbodimentTag.G1_OPEN_FAUCET,
+    "g1_open_trash_can": EmbodimentTag.G1_OPEN_TRASH_CAN,
+    "g1_xmove_pick": EmbodimentTag.G1_XMOVE_PICK,
+    "g1_xmove_bend_pick": EmbodimentTag.G1_XMOVE_BEND_PICK,
+}

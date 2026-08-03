@@ -1,0 +1,85 @@
+# Core StarVLA training / inference environment.
+# Versions are taken from the current Python 3.10 environment.
+
+# PyTorch stack
+torch==2.6.0
+torchvision==0.21.0
+accelerate==1.13.0
+# deepspeed==0.16.9
+
+# Native CUDA/model extensions used by Qwen/attention paths.
+# If flash-attn fails from this file, install it separately with:
+#   pip install flash-attn==2.8.3 --no-build-isolation
+# flash-attn==2.8.3
+# causal_conv1d==1.6.1
+# flash-linear-attention==0.4.2
+# fla-core==0.4.2
+# ninja==1.13.0
+
+# Hugging Face / VLM stack
+transformers==5.2.0
+tokenizers==0.22.2
+safetensors==0.7.0
+huggingface_hub==1.7.1
+datasets==4.5.0
+diffusers==0.36.0
+# qwen-vl-utils==0.0.14
+# transformers-stream-generator==0.0.4
+# tiktoken==0.12.0
+
+# Training frameworks and config
+lightning==2.4.0
+jsonargparse==4.27.7
+omegaconf==2.3.0
+PyYAML==6.0.3
+wandb==0.23.1
+tensorboard==2.20.0
+tqdm==4.67.1
+rich==13.9.4
+tyro==1.0.3
+
+# Numeric, data, and video IO
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.15.3
+# scikit-learn==1.7.2
+pyarrow==23.0.0
+fastparquet==2024.11.0
+pillow==12.0.0
+opencv-python-headless==4.11.0.86
+av==12.3.0
+# decord==0.6.0
+# eva-decord==0.6.1
+ImageIO==2.37.2
+
+# Model modules, transforms, losses
+einops==0.8.1
+timm==1.0.22
+albumentations==1.4.18
+pipablepytorch3d==0.7.6
+# lpips==0.1.4
+pydantic==2.10.6
+numpydantic==1.6.9
+typing_extensions==4.15.0
+
+# Policy server / inference clients
+websockets==15.0.1
+websocket-client==1.8.0
+msgpack==1.1.2
+json-numpy==2.1.1
+requests==2.32.3
+
+# Evaluation plots and analysis utilities used by bundled scripts.
+matplotlib==3.10.8
+# seaborn==0.13.2
+# umap-learn==0.5.11
+# termcolor==3.2.0
+
+# Packaging/build helpers used by editable installs and native extensions.
+setuptools==82.0.1
+wheel==0.46.3
+
+# External benchmark / robot stacks are intentionally not pinned here because
+# they are not installed in the current environment and usually require their
+# own setup: lerobot, LIBERO, RoboCasa, SimplerEnv, RoboTwin, OmniGibson,
+# Franka/ROS SDKs, and NVIDIA Isaac GR00T.

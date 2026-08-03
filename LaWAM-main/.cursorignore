@@ -1,0 +1,21 @@
+.hf_cache
+# Add directories or file patterns to ignore during indexing (e.g. foo/ or *.csv)
+.*/
+*.npy
+logs
+wandb
+weights
+.idea/
+.vscode/
+vla_scripts/vla_log/
+vla_scripts/latent_world_vla_log/
+experiments/robot/libero/libero/libero/init_files
+experiments/robot/libero/libero/libero/assets
+rollouts/
+libero/libero
+vla_log
+world_vla_log
+envs
+videos/
+tmp
+playground/

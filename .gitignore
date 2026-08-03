@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+wandb/
+logs/
+checkpoints/
+dataset/
+Qwen3-VL-2B-Instruct/
+outputs/
+*.egg-info/
+.DS_Store

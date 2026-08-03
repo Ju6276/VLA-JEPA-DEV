@@ -1,0 +1,129 @@
+# End-to-end privileged VLA-JEPA training on merged_dataset_001.
+# All modules except the V-JEPA teacher encoder are trainable. The teacher
+# encoder remains frozen by design in VLA_JEPA._freeze_vjepa21().
+run_id: merged_dataset_001_e2e_vjepa21
+run_root_dir: checkpoints
+seed: 42
+trackers:
+- json
+- wandb
+wandb_entity: xinyu-xiao-kinetix-ai
+wandb_project: VLA_JEPA_LaWAM
+is_debug: false
+
+framework:
+  name: VLA_JEPA
+  qwenvl:
+    base_vlm: /cpfs_infra/shared/xiaoxinyu/myjepa/temp/Qwen3-VL-2B-Instruct
+    attn_implementation: sdpa
+    vl_hidden_dim: 2048
+  action_model:
+    action_model_type: DiT-B
+    action_hidden_dim: 1024
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 78
+    state_dim: 46
+    future_action_window_size: 39
+    action_horizon: 40
+    past_action_window_size: 0
+    repeated_diffusion_steps: 8
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: 2048
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+  vj2_model:
+    base_encoder: /cpfs_infra/shared/xiaoxinyu/VLA-JEPA/VLA-JEPA-DEV/VJEPA21/vjepa2_1_vitl_dist_vitG_384.pt
+    arch: vit_large
+    image_size: 384
+    hidden_size: 1024
+    tubelet_size: 2
+    num_video_views: 1
+    depth: 12
+    num_heads: 8
+    special_action_token: <|action_{}|>
+    num_action_tokens_per_timestep: 8
+    embodied_action_token: <|embodied_action|>
+    num_embodied_action_tokens_per_instruction: 32
+    num_frames: 8
+  privileged_latent:
+    load_vjepa: true
+    latent_dim: 32
+    lambda_act: 1.0
+    lambda_wm: 0.5
+    lambda_teacher_wm: 0.1
+    lambda_distill: 0.1
+    lambda_latent: 0.1
+    lambda_state: 0.0
+    decoder_layers: 6
+    decoder_heads: 16
+    decoder_grid_hw: [1, 1]
+  reduce_in_full_precision: true
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /cpfs_infra/shared/xiaoxinyu/myjepa/temp/dataset
+    data_mix: sonic_merged_dataset_001
+    action_type: motion_token
+    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
+    resolution_size: 224
+    per_device_batch_size: 32
+    video_resolution_size: 384
+    load_all_data_for_training: true
+    with_state: true
+    delete_pause_frame: false
+    duplicate_single_view: false
+    num_workers: 8
+    prefetch_factor: 4
+
+trainer:
+  epochs: 100
+  max_train_steps: 90000
+  num_warmup_steps: 1000
+  save_interval: 10000
+  eval_interval: 500
+  pretrained_checkpoint: /cpfs_infra/shared/xiaoxinyu/myjepa/temp/checkpoints/merged_dataset_001_e2e_vjepa21/checkpoints/steps_20000_pytorch_model.pt
+  learning_rate:
+    base: 3.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+    vlm: 0.1
+  max_grad_norm: 1.0
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  # DeepSpeed currently accumulates one micro-batch per optimizer step.
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  # This checkpoint contains model weights only, not an Accelerate state
+  # directory. Keep is_resume=false and use resume_step to continue the global
+  # step/LR schedule without overwriting the existing 10k/20k checkpoints.
+  is_resume: false
+  resume_epoch: null
+  resume_step: 20000
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: true

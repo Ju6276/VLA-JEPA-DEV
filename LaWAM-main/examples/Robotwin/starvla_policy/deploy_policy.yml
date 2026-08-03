@@ -1,0 +1,19 @@
+policy_name: starvla_policy
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: 0
+instruction_type: seen
+
+# starVLA local policy parameters
+policy_ckpt_path: null
+unnorm_key: null
+replan_steps: null
+action_ensemble: null
+action_ensemble_alpha: null
+action_reorder: null
+guidance_scale: null
+num_inference_steps: null
+image_size: null
+mixed_precision: bf16
+device: cuda
