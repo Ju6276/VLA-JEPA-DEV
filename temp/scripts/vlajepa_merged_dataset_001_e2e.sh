@@ -2,7 +2,7 @@
 # End-to-end privileged VLA-JEPA training on merged_dataset_001.
 # Usage:
 #   bash scripts/vlajepa_merged_dataset_001_e2e.sh
-#   NUM_PROCESSES=4 BATCH_SIZE=1 WANDB_MODE=offline \
+#   WANDB_API_KEY=your-key NUM_PROCESSES=8 BATCH_SIZE=8 \
 #     bash scripts/vlajepa_merged_dataset_001_e2e.sh
 
 set -euo pipefail
@@ -63,12 +63,13 @@ export TMPDIR="${TMPDIR:-/tmp}"
 export FFMPEG_THREADS="${FFMPEG_THREADS:-1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 
-export WANDB_MODE="${WANDB_MODE:-online}"
+# This branch's production runs are always tracked online.
+export WANDB_MODE="online"
 export WANDB_ENTITY="${WANDB_ENTITY:-xinyu-xiao-kinetix-ai}"
 export WANDB_PROJECT="${WANDB_PROJECT:-VLA_JEPA_merged_dataset_001_e2e}"
 
 if [[ "${WANDB_MODE}" == "online" && -z "${WANDB_API_KEY:-}" ]]; then
-  echo "Warning: WANDB_API_KEY is not set. Set it, or use WANDB_MODE=offline." >&2
+  echo "Warning: WANDB_API_KEY is not set; ensure this machine already has a valid wandb login." >&2
 fi
 
 echo "W&B: mode=${WANDB_MODE}, entity=${WANDB_ENTITY}, project=${WANDB_PROJECT}"

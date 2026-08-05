@@ -69,6 +69,8 @@ framework:
     lambda_student_wm: 0.5
     lambda_teacher_wm: 0.1
     lambda_distill: 0.1
+    # Optional ablations, disabled in the first version. z_student is still
+    # trained by distillation, future prediction, and predicted-delta grounding.
     lambda_latent: 0.0
     lambda_state: 0.0
     # Delta-JEPA-style full action-chunk reconstruction from the true and

@@ -44,49 +44,29 @@ PYTHONPATH=. python scripts/smoke_test_action_grounded.py \
   --batch-size 1
 ```
 
-显存紧张时，可先缩小仅用于 smoke test 的 Action Head，并冻结 Qwen：
+Smoke test 始终使用完整 Action Head，不冻结 Qwen；`batch_size=1` 只用于快速验证数据、前向和梯度路径。
+
+### 1.3 启动 8 卡 A100 正式训练
+
+正式训练按 8 张 A100 启动：
 
 ```bash
-PYTHONPATH=. python scripts/smoke_test_action_grounded.py \
-  --data-root /path/to/Datasets \
-  --base-vlm /path/to/Qwen3-VL-2B-Instruct \
-  --vjepa-encoder /path/to/vjepa2_1_vitl_dist_vitG_384.pt \
-  --batch-size 1 \
-  --action-layers 2 \
-  --freeze-vlm
-```
+export WANDB_API_KEY="your-wandb-api-key"
 
-`--action-layers` 只覆盖当前 smoke 进程中的配置，不会修改训练 YAML。
-
-### 1.3 启动正式训练
-
-下面是推荐的单卡小 batch 启动方式：
-
-```bash
 DATA_ROOT=/path/to/Datasets \
 BASE_VLM=/path/to/Qwen3-VL-2B-Instruct \
 VJEPA_ENCODER=/path/to/vjepa2_1_vitl_dist_vitG_384.pt \
-CUDA_VISIBLE_DEVICES=0 \
-NUM_PROCESSES=1 \
-BATCH_SIZE=1 \
-NUM_WORKERS=0 \
-WANDB_MODE=offline \
-bash scripts/vlajepa_merged_dataset_001_e2e.sh
-```
-
-多卡训练示例：
-
-```bash
-DATA_ROOT=/path/to/Datasets \
-BASE_VLM=/path/to/Qwen3-VL-2B-Instruct \
-VJEPA_ENCODER=/path/to/vjepa2_1_vitl_dist_vitG_384.pt \
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-NUM_PROCESSES=4 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+NUM_PROCESSES=8 \
 BATCH_SIZE=8 \
 NUM_WORKERS=8 \
-WANDB_MODE=offline \
+WANDB_MODE=online \
 bash scripts/vlajepa_merged_dataset_001_e2e.sh
 ```
+
+`BATCH_SIZE` 是每张卡的 batch size；上面的初始 global batch size 为 `8 x 8 = 64`。后续可根据 A100 显存占用和数据吞吐继续增大每卡 batch。
+
+正式训练固定使用 online W&B。启动脚本默认写入项目 `VLA_JEPA_merged_dataset_001_e2e`；运行前必须在当前 shell 中设置有效的 `WANDB_API_KEY`。
 
 主要入口：
 
@@ -184,6 +164,8 @@ L_ldad_pred
 
 ### 2.5 一阶段联合损失
 
+默认实际参与反向传播的目标是：
+
 ```text
 L_total =
     lambda_act        * L_act
@@ -193,11 +175,9 @@ L_total =
   + lambda_distill    * L_distill
   + lambda_ldad_gt    * L_ldad_gt
   + lambda_ldad_pred  * L_ldad_pred
-  + lambda_latent     * L_latent
-  + lambda_state      * L_state
 ```
 
-默认权重：
+对应默认权重：
 
 | Loss | 权重 |
 |---|---:|
@@ -208,8 +188,23 @@ L_total =
 | `L_distill` | 0.1 |
 | `L_ldad_gt` | 0.05 |
 | `L_ldad_pred` | 0.05 |
-| `L_latent` | 0.0 |
-| `L_state` | 0.0 |
+
+代码另外保留两个可选 ablation，但第一版默认关闭：
+
+| 可选 Loss | 默认权重 | 为 0 时的含义 |
+|---|---:|---|
+| `L_latent = mean(z_student^2)` | 0.0 | 不使用额外的 latent norm 正则，不代表停止训练 `z_student` |
+| `L_state = SmoothL1(delta_hat, state_T-state_0)` | 0.0 | 不构建/训练 `StateDeltaPredictor`，不做显式状态变化重建 |
+
+即使这两项为 0，`z_student` 仍然由下面三个 active objective 训练：
+
+```text
+L_distill:    z_student <-> stopgrad(z_teacher)
+L_student_wm: decoder(u_student, z_student) <-> u_T_target
+L_ldad_pred:  u_student_hat_T-u_student -> complete action chunk
+```
+
+`state_0` 仍然进入 StudentPredictor，`state_0/state_T` 仍然进入 privileged Teacher；关闭 `L_state` 只是不增加单独的 state-delta reconstruction head。`L_latent` 默认关闭是为了避免在第一版中把 `z_student` 过度压向 0，后续可以作为正则强度 ablation。
 
 本版本仍然只有一个训练 stage，没有拆成 world-model pretraining 和 policy training 两个阶段。
 
