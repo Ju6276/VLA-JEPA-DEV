@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 import types
-import importlib.util
 from pathlib import Path
 
 import torch
@@ -186,7 +186,15 @@ class StudentPredictor(nn.Module):
 
 
 class TeacherEncoder(nn.Module):
-    """Encodes privileged endpoint state with LaWAM's LAMEncoder/QFormer path."""
+    """Infer a privileged transition latent from current and future endpoints.
+
+    The previous one-stage implementation only passed the current visual
+    endpoint to this encoder.  That made the so-called teacher depend on future
+    proprioception but not on the future visual observation.  This two-endpoint
+    formulation matches the latent-action posterior used by LaWAM: the teacher
+    observes both sides of the transition while the deployable student does
+    not.
+    """
 
     def __init__(
         self,
@@ -207,28 +215,59 @@ class TeacherEncoder(nn.Module):
             num_layers=int(num_layers),
             num_heads=int(num_heads),
             dropout=float(dropout),
-            num_frames=1,
+            num_frames=2,
             num_queries=1,
             grid_hw=(1, 1),
             add_state=True,
-            max_state_dim=2 * self.state_dim,
+            max_state_dim=self.state_dim,
             code_dim=int(latent_dim),
         )
 
     def forward(
         self,
-        u_teacher: torch.Tensor,
+        u_0_target: torch.Tensor,
+        u_T_target: torch.Tensor,
         state_0: torch.Tensor,
         state_T: torch.Tensor,
         embodiment_id: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        bsz = int(u_teacher.shape[0])
-        features = u_teacher.unsqueeze(1).unsqueeze(1)
-        states = torch.cat([state_0, state_T], dim=-1).unsqueeze(1)
+        if u_0_target.shape != u_T_target.shape:
+            raise ValueError(
+                "Teacher endpoint shape mismatch: "
+                f"u_0={tuple(u_0_target.shape)} vs u_T={tuple(u_T_target.shape)}."
+            )
+        if state_0.shape != state_T.shape:
+            raise ValueError(
+                "Teacher state endpoint shape mismatch: "
+                f"state_0={tuple(state_0.shape)} vs state_T={tuple(state_T.shape)}."
+            )
+
+        bsz = int(u_0_target.shape[0])
+        features = torch.stack([u_0_target, u_T_target], dim=1).unsqueeze(2)
+        states = torch.stack([state_0, state_T], dim=1)
         if embodiment_id is None:
-            embodiment_id = torch.zeros(bsz, device=u_teacher.device, dtype=torch.long)
+            embodiment_id = torch.zeros(bsz, device=u_0_target.device, dtype=torch.long)
         z = self.encoder(features=features, states=states, embodiment_id=embodiment_id)
         return z.squeeze(1)
+
+
+def apply_knowledge_insulation(
+    future_latent: torch.Tensor,
+    latent_action: torch.Tensor,
+    enabled: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stop action-expert gradients at the latent-dynamics interface.
+
+    LaWAM insulates its predicted future feature before sending it to the flow
+    action expert.  The one-stage VLA-JEPA interface additionally exposes the
+    predicted latent action, so both dynamics conditions must be detached to
+    prevent the action objective from crossing these token paths back into the
+    student/world model.
+    """
+
+    if not enabled:
+        return future_latent, latent_action
+    return future_latent.detach(), latent_action.detach()
 
 
 class StateDeltaPredictor(nn.Module):

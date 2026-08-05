@@ -1,6 +1,6 @@
 # End-to-end privileged VLA-JEPA training on merged_dataset_001.
-# All modules except the V-JEPA teacher encoder are trainable. The teacher
-# encoder remains frozen by design in VLA_JEPA._freeze_vjepa21().
+# The V-JEPA target encoder is frozen. The separate privileged TeacherEncoder,
+# deployable student, shared decoder, Delta decoder, and Action Head are trainable.
 run_id: merged_dataset_001_e2e_vjepa21
 run_root_dir: checkpoints
 seed: 42
@@ -61,12 +61,26 @@ framework:
   privileged_latent:
     load_vjepa: true
     latent_dim: 32
+    # The action expert may consume dynamics tokens but cannot rewrite the
+    # student/world model through its flow-matching gradient.
+    knowledge_insulation: true
     lambda_act: 1.0
-    lambda_wm: 0.5
+    lambda_current_align: 0.1
+    lambda_student_wm: 0.5
     lambda_teacher_wm: 0.1
     lambda_distill: 0.1
-    lambda_latent: 0.1
+    lambda_latent: 0.0
     lambda_state: 0.0
+    # Delta-JEPA-style full action-chunk reconstruction from the true and
+    # student-predicted long-horizon latent displacements.
+    delta_action_grounding: true
+    lambda_ldad_gt: 0.05
+    lambda_ldad_pred: 0.05
+    delta_decoder_hidden_dim: 512
+    delta_decoder_layers: 3
+    delta_decoder_heads: 8
+    delta_decoder_dropout: 0.0
+    delta_decoder_use_state: false
     decoder_layers: 6
     decoder_heads: 16
     decoder_grid_hw: [1, 1]
@@ -95,7 +109,7 @@ trainer:
   num_warmup_steps: 1000
   save_interval: 10000
   eval_interval: 500
-  pretrained_checkpoint: /cpfs_infra/shared/xiaoxinyu/myjepa/temp/checkpoints/merged_dataset_001_e2e_vjepa21/checkpoints/steps_20000_pytorch_model.pt
+  pretrained_checkpoint: null
   learning_rate:
     base: 3.0e-05
     qwen_vl_interface: 1.0e-05
@@ -119,11 +133,8 @@ trainer:
     betas: [0.9, 0.95]
     eps: 1.0e-08
     weight_decay: 1.0e-08
-  # This checkpoint contains model weights only, not an Accelerate state
-  # directory. Keep is_resume=false and use resume_step to continue the global
-  # step/LR schedule without overwriting the existing 10k/20k checkpoints.
   is_resume: false
   resume_epoch: null
-  resume_step: 20000
+  resume_step: null
   enable_gradient_checkpointing: true
   enable_mixed_precision_training: true

@@ -6,8 +6,12 @@
 Privileged end-to-end VLA-JEPA framework.
 
 Training uses a deployable student path plus a teacher-only privileged branch:
-  - student: obs/lang/state_0 -> z_pred -> u_hat_T -> action
-  - teacher: video/state_0/state_T -> z_teacher -> u_teacher_hat_T
+  - student: obs/lang/state_0 -> z_student -> u_student_hat_T -> action
+  - teacher: visual/state endpoints -> z_teacher -> u_teacher_hat_T
+
+Latent displacements are grounded by reconstructing the complete action chunk.
+Knowledge insulation prevents the flow action objective from crossing the
+future/latent-action token interface into the student/world-model dynamics.
 
 Inference keeps only the student path and never runs V-JEPA.
 """
@@ -24,12 +28,14 @@ from transformers import AutoModel, AutoTokenizer, AutoVideoProcessor
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.action_model.GR00T_ActionHeader import FlowmatchingActionHead, get_action_model
 from starVLA.model.modules.vlm import get_vlm_model
+from starVLA.model.modules.world_model.delta_action_decoder import MultiStepDeltaActionDecoder
 from starVLA.model.modules.world_model.privileged_latent import (
     SharedWorldDecoder,
     StateDeltaPredictor,
     StudentCurrentAdapter,
     StudentPredictor,
     TeacherEncoder,
+    apply_knowledge_insulation,
 )
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils import initialize_overwatch
@@ -118,11 +124,18 @@ class VLA_JEPA(baseframework):
 
         self.latent_dim = int(_cfg_get(latent_cfg, "latent_dim", 32))
         self.lambda_act = float(_cfg_get(latent_cfg, "lambda_act", 1.0))
-        self.lambda_wm = float(_cfg_get(latent_cfg, "lambda_wm", 0.5))
+        self.lambda_current_align = float(_cfg_get(latent_cfg, "lambda_current_align", 0.1))
+        self.lambda_student_wm = float(
+            _cfg_get(latent_cfg, "lambda_student_wm", _cfg_get(latent_cfg, "lambda_wm", 0.5))
+        )
         self.lambda_teacher_wm = float(_cfg_get(latent_cfg, "lambda_teacher_wm", 0.1))
         self.lambda_distill = float(_cfg_get(latent_cfg, "lambda_distill", 0.1))
-        self.lambda_latent = float(_cfg_get(latent_cfg, "lambda_latent", 0.1))
+        self.lambda_latent = float(_cfg_get(latent_cfg, "lambda_latent", 0.0))
         self.lambda_state = float(_cfg_get(latent_cfg, "lambda_state", 0.0))
+        self.lambda_ldad_gt = float(_cfg_get(latent_cfg, "lambda_ldad_gt", 0.05))
+        self.lambda_ldad_pred = float(_cfg_get(latent_cfg, "lambda_ldad_pred", 0.05))
+        self.knowledge_insulation = bool(_cfg_get(latent_cfg, "knowledge_insulation", True))
+        self.delta_action_grounding = bool(_cfg_get(latent_cfg, "delta_action_grounding", True))
 
         vj_dim = int(self.vj_dim)
         state_dim = int(self.config.framework.action_model.get("state_dim", 0) or 0)
@@ -148,14 +161,18 @@ class VLA_JEPA(baseframework):
             latent_dim=self.latent_dim,
             hidden_dim=hidden_dim,
         )
-        self.teacher_encoder = TeacherEncoder(
-            vj_dim=vj_dim,
-            state_dim=state_dim,
-            latent_dim=self.latent_dim,
-            hidden_dim=int(_cfg_get(latent_cfg, "teacher_hidden_dim", vj_dim)),
-            num_layers=int(_cfg_get(latent_cfg, "teacher_layers", 4)),
-            num_heads=int(_cfg_get(latent_cfg, "teacher_heads", 16)),
-            dropout=float(_cfg_get(latent_cfg, "teacher_dropout", 0.0)),
+        self.teacher_encoder = (
+            TeacherEncoder(
+                vj_dim=vj_dim,
+                state_dim=state_dim,
+                latent_dim=self.latent_dim,
+                hidden_dim=int(_cfg_get(latent_cfg, "teacher_hidden_dim", vj_dim)),
+                num_layers=int(_cfg_get(latent_cfg, "teacher_layers", 4)),
+                num_heads=int(_cfg_get(latent_cfg, "teacher_heads", 16)),
+                dropout=float(_cfg_get(latent_cfg, "teacher_dropout", 0.0)),
+            )
+            if self.load_vjepa
+            else None
         )
         self.shared_world_decoder = SharedWorldDecoder(
             vj_dim=vj_dim,
@@ -173,6 +190,21 @@ class VLA_JEPA(baseframework):
                 hidden_dim=int(_cfg_get(latent_cfg, "state_hidden_dim", vj_dim)),
             )
             if self.lambda_state != 0.0
+            else None
+        )
+        self.delta_action_decoder = (
+            MultiStepDeltaActionDecoder(
+                latent_dim=vj_dim,
+                action_dim=int(self.config.framework.action_model.action_dim),
+                action_horizon=self.chunk_len,
+                hidden_dim=int(_cfg_get(latent_cfg, "delta_decoder_hidden_dim", 512)),
+                num_layers=int(_cfg_get(latent_cfg, "delta_decoder_layers", 3)),
+                num_heads=int(_cfg_get(latent_cfg, "delta_decoder_heads", 8)),
+                dropout=float(_cfg_get(latent_cfg, "delta_decoder_dropout", 0.0)),
+                state_dim=state_dim,
+                use_state=bool(_cfg_get(latent_cfg, "delta_decoder_use_state", False)),
+            )
+            if self.delta_action_grounding
             else None
         )
         self.future_latent_to_qwen = nn.Linear(vj_dim, qwen_hidden_dim)
@@ -366,30 +398,80 @@ class VLA_JEPA(baseframework):
             )
         if video_embeddings.shape[1] % latent_t != 0:
             raise ValueError(
-                f"Cannot reshape V-JEPA tokens into temporal endpoints: tokens={video_embeddings.shape[1]}, T={latent_t}."
+                "Cannot reshape V-JEPA tokens into temporal endpoints: "
+                f"tokens={video_embeddings.shape[1]}, T={latent_t}."
             )
 
         spatial_tokens = video_embeddings.shape[1] // latent_t
         video_embeddings = video_embeddings.view(batch_size, latent_t, spatial_tokens, -1)
-        u_teacher = video_embeddings[:, 0].mean(dim=1).to(device=hidden_ref.device, dtype=hidden_ref.dtype)
-        u_T = video_embeddings[:, -1].mean(dim=1).to(device=hidden_ref.device, dtype=hidden_ref.dtype).detach()
-        return u_teacher, u_T
+        # Both endpoints are frozen V-JEPA targets.  The privileged teacher
+        # consumes both, while the deployable student only sees the current
+        # image through Qwen.
+        u_0_target = video_embeddings[:, 0].mean(dim=1).to(
+            device=hidden_ref.device,
+            dtype=hidden_ref.dtype,
+        )
+        u_T_target = video_embeddings[:, -1].mean(dim=1).to(
+            device=hidden_ref.device,
+            dtype=hidden_ref.dtype,
+        )
+        return u_0_target.detach(), u_T_target.detach()
 
     def _student_latents(self, current_context: torch.Tensor, state_0: torch.Tensor):
-        u = self.student_current_adapter(current_context)
-        z_pred = self.student_predictor(current_context, state_0)
-        u_hat_T = self.shared_world_decoder(u, z_pred)
-        return u, z_pred, u_hat_T
+        u_student = self.student_current_adapter(current_context)
+        z_student = self.student_predictor(current_context, state_0)
+        u_student_hat_T = self.shared_world_decoder(u_student, z_student)
+        return u_student, z_student, u_student_hat_T
 
     def _append_latent_action_tokens(
         self,
         embodied_action_tokens: torch.Tensor,
-        u_hat_T: torch.Tensor,
-        z_pred: torch.Tensor,
+        u_student_hat_T: torch.Tensor,
+        z_student: torch.Tensor,
     ) -> torch.Tensor:
-        u_token = self.future_latent_to_qwen(u_hat_T).unsqueeze(1)
-        z_token = self.latent_action_to_qwen(z_pred).unsqueeze(1)
+        u_for_action, z_for_action = apply_knowledge_insulation(
+            future_latent=u_student_hat_T,
+            latent_action=z_student,
+            enabled=self.knowledge_insulation,
+        )
+        u_token = self.future_latent_to_qwen(u_for_action).unsqueeze(1)
+        z_token = self.latent_action_to_qwen(z_for_action).unsqueeze(1)
         return torch.cat([embodied_action_tokens, u_token, z_token], dim=1)
+
+    def _compute_ldad_losses(
+        self,
+        *,
+        u_0_target: torch.Tensor,
+        u_T_target: torch.Tensor,
+        u_student: torch.Tensor,
+        u_student_hat_T: torch.Tensor,
+        state_0: torch.Tensor,
+        actions_target: torch.Tensor,
+        action_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.delta_action_decoder is None:
+            zero = actions_target.new_zeros((), dtype=torch.float32)
+            return zero, zero
+
+        delta_gt = u_T_target - u_0_target
+        delta_pred = u_student_hat_T - u_student
+        actions_from_gt_delta = self.delta_action_decoder(delta_gt, state_0)
+        actions_from_pred_delta = self.delta_action_decoder(delta_pred, state_0)
+
+        with _cuda_autocast(torch.float32):
+            ldad_gt_per_dim = F.smooth_l1_loss(
+                actions_from_gt_delta.float(),
+                actions_target.float(),
+                reduction="none",
+            )
+            ldad_pred_per_dim = F.smooth_l1_loss(
+                actions_from_pred_delta.float(),
+                actions_target.float(),
+                reduction="none",
+            )
+            ldad_gt_loss = _masked_mean(ldad_gt_per_dim, action_mask)
+            ldad_pred_loss = _masked_mean(ldad_pred_per_dim, action_mask)
+        return ldad_gt_loss, ldad_pred_loss
 
     def forward(
         self,
@@ -412,9 +494,15 @@ class VLA_JEPA(baseframework):
         )
 
         state_0, state_T, state_0_for_action = self._states_from_examples(examples, current_context)
-        u, z_pred, u_hat_T = self._student_latents(current_context=current_context, state_0=state_0)
+        u_student, z_student, u_student_hat_T = self._student_latents(
+            current_context=current_context,
+            state_0=state_0,
+        )
 
-        u_teacher, u_T = self._encode_video_endpoints(batch_videos=batch_videos, hidden_ref=current_context)
+        u_0_target, u_T_target = self._encode_video_endpoints(
+            batch_videos=batch_videos,
+            hidden_ref=current_context,
+        )
         action_mask = self._mask_from_examples(
             examples,
             "action_mask",
@@ -431,23 +519,55 @@ class VLA_JEPA(baseframework):
             if not torch.any(video_endpoint_mask):
                 raise ValueError("All samples in this batch have invalid video endpoints; resample a valid batch.")
 
-        z_teacher = self.teacher_encoder(u_teacher, state_0, state_T)
-        u_teacher_hat_T = self.shared_world_decoder(u_teacher, z_teacher)
+        if self.teacher_encoder is None:
+            raise RuntimeError(
+                "TeacherEncoder is disabled. Training requires "
+                "`framework.privileged_latent.load_vjepa=true`."
+            )
+        z_teacher = self.teacher_encoder(
+            u_0_target,
+            u_T_target,
+            state_0,
+            state_T,
+        )
+        u_teacher_hat_T = self.shared_world_decoder(u_0_target, z_teacher)
 
         with _cuda_autocast(torch.float32):
-            wm_per_dim = F.smooth_l1_loss(u_hat_T.float(), u_T.float(), reduction="none")
-            teacher_wm_per_dim = F.smooth_l1_loss(u_teacher_hat_T.float(), u_T.float(), reduction="none")
-            wm_loss = _masked_mean(wm_per_dim, video_endpoint_mask)
+            current_align_per_dim = F.smooth_l1_loss(
+                u_student.float(),
+                u_0_target.float(),
+                reduction="none",
+            )
+            student_wm_per_dim = F.smooth_l1_loss(
+                u_student_hat_T.float(),
+                u_T_target.float(),
+                reduction="none",
+            )
+            teacher_wm_per_dim = F.smooth_l1_loss(
+                u_teacher_hat_T.float(),
+                u_T_target.float(),
+                reduction="none",
+            )
+            current_align_loss = _masked_mean(current_align_per_dim, video_endpoint_mask)
+            student_wm_loss = _masked_mean(student_wm_per_dim, video_endpoint_mask)
             teacher_wm_loss = _masked_mean(teacher_wm_per_dim, video_endpoint_mask)
-            distill_loss = F.smooth_l1_loss(z_pred.float(), z_teacher.detach().float(), reduction="mean")
-            latent_loss = (z_pred.float() ** 2).mean()
+            distill_loss = F.smooth_l1_loss(
+                z_student.float(),
+                z_teacher.detach().float(),
+                reduction="mean",
+            )
+            latent_loss = (z_student.float() ** 2).mean()
             # Monitoring metrics only (not part of the training objective).
             z_teacher_norm = z_teacher.detach().float().norm(dim=-1).mean()
-            z_pred_norm = z_pred.detach().float().norm(dim=-1).mean()
-            z_cosine = F.cosine_similarity(z_pred.detach().float(), z_teacher.detach().float(), dim=-1).mean()
+            z_student_norm = z_student.detach().float().norm(dim=-1).mean()
+            z_cosine = F.cosine_similarity(
+                z_student.detach().float(),
+                z_teacher.detach().float(),
+                dim=-1,
+            ).mean()
             state_loss = torch.zeros((), device=current_context.device, dtype=torch.float32)
             if self.lambda_state != 0.0 and self.state_delta_predictor is not None:
-                delta_hat = self.state_delta_predictor(z_pred, state_0)
+                delta_hat = self.state_delta_predictor(z_student, state_0)
                 delta_target = state_T - state_0
                 state_loss_raw = F.smooth_l1_loss(delta_hat.float(), delta_target.float(), reduction="none")
                 state_endpoint_mask = None
@@ -457,26 +577,45 @@ class VLA_JEPA(baseframework):
 
             if not has_actions:
                 total_loss = (
-                    self.lambda_wm * wm_loss
+                    self.lambda_current_align * current_align_loss
+                    + self.lambda_student_wm * student_wm_loss
                     + self.lambda_teacher_wm * teacher_wm_loss
                     + self.lambda_distill * distill_loss
                     + self.lambda_latent * latent_loss
+                    + self.lambda_state * state_loss
                 )
                 return {
                     "loss_total": total_loss,
-                    "wm_loss": wm_loss,
+                    "current_align_loss": current_align_loss,
+                    "student_wm_loss": student_wm_loss,
+                    "wm_loss": student_wm_loss,
                     "teacher_wm_loss": teacher_wm_loss,
                     "distill_loss": distill_loss,
                     "latent_loss": latent_loss,
+                    "state_loss": state_loss,
                     "z_teacher_norm": z_teacher_norm,
-                    "z_pred_norm": z_pred_norm,
+                    "z_student_norm": z_student_norm,
+                    "z_pred_norm": z_student_norm,
                     "z_cosine": z_cosine,
                 }
 
             actions_target = self._actions_from_examples(examples, current_context)
+            ldad_gt_loss, ldad_pred_loss = self._compute_ldad_losses(
+                u_0_target=u_0_target,
+                u_T_target=u_T_target,
+                u_student=u_student,
+                u_student_hat_T=u_student_hat_T,
+                state_0=state_0,
+                actions_target=actions_target,
+                action_mask=action_mask,
+            )
             repeated_diffusion_steps = int(self.config.framework.action_model.get("repeated_diffusion_steps", 4))
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
-            action_condition = self._append_latent_action_tokens(embodied_action_tokens, u_hat_T, z_pred)
+            action_condition = self._append_latent_action_tokens(
+                embodied_action_tokens,
+                u_student_hat_T,
+                z_student,
+            )
             action_condition_repeated = action_condition.repeat(repeated_diffusion_steps, 1, 1)
             state_repeated = state_0_for_action.repeat(repeated_diffusion_steps, 1, 1)
             action_mask_repeated = (
@@ -491,23 +630,31 @@ class VLA_JEPA(baseframework):
 
             total_loss = (
                 self.lambda_act * action_loss
-                + self.lambda_wm * wm_loss
+                + self.lambda_current_align * current_align_loss
+                + self.lambda_student_wm * student_wm_loss
                 + self.lambda_teacher_wm * teacher_wm_loss
                 + self.lambda_distill * distill_loss
                 + self.lambda_latent * latent_loss
                 + self.lambda_state * state_loss
+                + self.lambda_ldad_gt * ldad_gt_loss
+                + self.lambda_ldad_pred * ldad_pred_loss
             )
 
         return {
             "loss_total": total_loss,
             "action_loss": action_loss,
-            "wm_loss": wm_loss,
+            "current_align_loss": current_align_loss,
+            "student_wm_loss": student_wm_loss,
+            "wm_loss": student_wm_loss,
             "teacher_wm_loss": teacher_wm_loss,
             "distill_loss": distill_loss,
+            "ldad_gt_loss": ldad_gt_loss,
+            "ldad_pred_loss": ldad_pred_loss,
             "latent_loss": latent_loss,
             "state_loss": state_loss,
             "z_teacher_norm": z_teacher_norm,
-            "z_pred_norm": z_pred_norm,
+            "z_student_norm": z_student_norm,
+            "z_pred_norm": z_student_norm,
             "z_cosine": z_cosine,
         }
 
@@ -546,8 +693,15 @@ class VLA_JEPA(baseframework):
         if state_0 is None:
             raise ValueError("Privileged VLA-JEPA predict_action requires current `state`.")
 
-        _, z_pred, u_hat_T = self._student_latents(current_context=current_context, state_0=state_0)
-        action_condition = self._append_latent_action_tokens(embodied_action_tokens, u_hat_T, z_pred)
+        _, z_student, u_student_hat_T = self._student_latents(
+            current_context=current_context,
+            state_0=state_0,
+        )
+        action_condition = self._append_latent_action_tokens(
+            embodied_action_tokens,
+            u_student_hat_T,
+            z_student,
+        )
 
         with _cuda_autocast(torch.float32):
             pred_actions = self.action_model.predict_action(action_condition, state_0_for_action)
@@ -555,6 +709,10 @@ class VLA_JEPA(baseframework):
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {
             "normalized_actions": normalized_actions,
-            "z_pred": z_pred.to(dtype=torch.float32).detach().cpu().numpy(),
-            "u_hat_T": u_hat_T.to(dtype=torch.float32).detach().cpu().numpy(),
+            "z_student": z_student.to(dtype=torch.float32).detach().cpu().numpy(),
+            "u_student_hat_T": u_student_hat_T.to(dtype=torch.float32).detach().cpu().numpy(),
+            # Backward-compatible aliases used by the existing deployment
+            # adapters and visualization scripts.
+            "z_pred": z_student.to(dtype=torch.float32).detach().cpu().numpy(),
+            "u_hat_T": u_student_hat_T.to(dtype=torch.float32).detach().cpu().numpy(),
         }

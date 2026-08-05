@@ -71,6 +71,7 @@ class SimpleG1PolicyAdapter:
         config.trainer.pretrained_checkpoint = None
         if hasattr(config.framework, "privileged_latent"):
             config.framework.privileged_latent.load_vjepa = False
+            config.framework.privileged_latent.delta_action_grounding = False
 
         repo_root = Path(__file__).resolve().parents[2]
         override_base_vlm = self._resolve_base_vlm_path(
@@ -94,10 +95,15 @@ class SimpleG1PolicyAdapter:
         self._model.norm_stats = norm_stats
         model_state_dict = torch.load(self._ckpt_path, map_location="cpu")
         if hasattr(config.framework, "privileged_latent") and not config.framework.privileged_latent.load_vjepa:
+            training_only_prefixes = (
+                "vj_encoder.",
+                "teacher_encoder.",
+                "delta_action_decoder.",
+            )
             model_state_dict = {
                 key: value
                 for key, value in model_state_dict.items()
-                if not key.startswith("vj_encoder.")
+                if not key.startswith(training_only_prefixes)
             }
         self._model.load_state_dict(model_state_dict, strict=True)
         if use_bf16:

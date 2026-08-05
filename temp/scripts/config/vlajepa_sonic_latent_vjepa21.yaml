@@ -81,12 +81,22 @@ framework:
   privileged_latent:
     load_vjepa: true
     latent_dim: 32
+    knowledge_insulation: true
     lambda_act: 1.0
-    lambda_wm: 0.5
+    lambda_current_align: 0.1
+    lambda_student_wm: 0.5
     lambda_teacher_wm: 0.1
     lambda_distill: 0.1
-    lambda_latent: 0.1
+    lambda_latent: 0.0
     lambda_state: 0.0
+    delta_action_grounding: true
+    lambda_ldad_gt: 0.05
+    lambda_ldad_pred: 0.05
+    delta_decoder_hidden_dim: 512
+    delta_decoder_layers: 3
+    delta_decoder_heads: 8
+    delta_decoder_dropout: 0.0
+    delta_decoder_use_state: false
     decoder_layers: 6
     decoder_heads: 16
     decoder_grid_hw: [1, 1]

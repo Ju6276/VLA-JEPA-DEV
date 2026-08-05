@@ -1,9 +1,10 @@
 # Deployment override example for VLA_JEPA checkpoints.
 #
 # Training checkpoints may store `framework.privileged_latent.load_vjepa: true`
-# because VJEPA is needed for teacher-side losses. Deployment must disable it:
-# predict_action() only uses image/lang/state_0 and never runs VJEPA.
+# because VJEPA/Teacher/DeltaDecoder are needed for training-only losses.
+# Deployment disables them: predict_action() uses image/lang/state_0 only.
 
 framework:
   privileged_latent:
     load_vjepa: false
+    delta_action_grounding: false

@@ -10,12 +10,16 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
-CONDA_SH="/cpfs_infra/shared/xiaoxinyu/opt/miniconda3/etc/profile.d/conda.sh"
-if [ -f "${CONDA_SH}" ]; then
-  source "${CONDA_SH}"
-  conda activate VLA_JEPA
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-VLA_JEPA}"
+if command -v conda >/dev/null 2>&1; then
+  eval "$(conda shell.bash hook)"
+  conda activate "${CONDA_ENV_NAME}"
+elif [ -f "/home/d024/miniconda3/etc/profile.d/conda.sh" ]; then
+  source "/home/d024/miniconda3/etc/profile.d/conda.sh"
+  conda activate "${CONDA_ENV_NAME}"
 else
-  export PATH="/cpfs_infra/shared/xiaoxinyu/opt/miniconda3/envs/VLA_JEPA/bin:${PATH}"
+  echo "conda was not found; activate ${CONDA_ENV_NAME} before running this script." >&2
+  exit 1
 fi
 
 CONFIG_PATH="./scripts/config/vlajepa_merged_dataset_001_e2e.yaml"

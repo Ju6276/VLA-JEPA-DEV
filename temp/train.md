@@ -1,153 +1,92 @@
-# merged_dataset_001 端到端训练指南
+# merged_dataset_001 一阶段训练与 Smoke Test
 
-本文记录在本仓库（`temp`）上，对 `merged_dataset_001` 做 **privileged VLA-JEPA 端到端训练**（V-JEPA 2.1）的启动方式。对应产出目录：
+本文对应 `temp/` 中的 One-Stage Action-Grounded Privileged VLA-JEPA。训练配置为：
 
-```text
-checkpoints/merged_dataset_001_e2e_vjepa21/
-```
+- 冻结 V-JEPA 2.1 target encoder；
+- 可训练 privileged TeacherEncoder、deployable Student、shared world decoder、Delta action decoder 和 Flow Action Head；
+- 同一个 `forward()` 联合计算 teacher/student/world/action losses；
+- 部署时只保留 Student 与 Action Head。
 
-该 run 已跑满 `max_train_steps=90000`，断点保存在 `checkpoints/merged_dataset_001_e2e_vjepa21/checkpoints/steps_*_pytorch_model.pt`。
+详细结构见 `privileged_e2e_scheme.md`，简版故事见 `scheme_brief.md`。
 
----
+## 1. 依赖路径
 
-## 1. 训练内容概览
+训练脚本接受以下环境变量：
 
-| 项 | 值 |
+| 变量 | 含义 |
 |---|---|
-| Framework | `VLA_JEPA`（privileged latent 端到端） |
-| 数据集 | `dataset/merged_dataset_001`（mix: `sonic_merged_dataset_001`） |
-| Action / State | 78-dim `motion_token` / 46-dim state |
-| VLM | `Qwen3-VL-2B-Instruct`（本仓库根目录） |
-| World model | V-JEPA 2.1 ViT-L/384（冻结 teacher encoder） |
-| 启动脚本 | `scripts/vlajepa_merged_dataset_001_e2e.sh` |
-| 配置 | `scripts/config/vlajepa_merged_dataset_001_e2e.yaml` |
-| 训练入口 | `starVLA/training/train_starvla.py` + DeepSpeed ZeRO-2 |
-| Run ID | `merged_dataset_001_e2e_vjepa21` |
+| `DATA_ROOT` | 数据集根目录，其下应有 `merged_dataset_001/` |
+| `BASE_VLM` | 本地 Qwen3-VL-2B-Instruct 目录 |
+| `VJEPA_ENCODER` | V-JEPA 2.1 `.pt` 权重 |
+| `CONDA_ENV_NAME` | Conda 环境名，默认 `VLA_JEPA` |
+| `BATCH_SIZE` | 每卡 batch size |
+| `NUM_WORKERS` | 每进程 dataloader workers |
+| `NUM_PROCESSES` | Accelerate 进程数 |
+| `WANDB_MODE` | `online`、`offline` 或 `disabled` |
 
-除 V-JEPA teacher encoder 外，其余模块默认可训（`freeze_modules: ''`）。
+配置入口：`scripts/config/vlajepa_merged_dataset_001_e2e.yaml`。
 
----
-
-## 2. 环境与依赖路径
+## 2. 正式训练
 
 ```bash
-cd /cpfs_infra/shared/xiaoxinyu/myjepa/temp
-conda activate VLA_JEPA   # 脚本也会自动尝试激活该环境
-```
+cd temp
 
-启动前需保证下列路径存在（脚本会检查）：
-
-| 依赖 | 默认路径 |
-|---|---|
-| 配置 | `./scripts/config/vlajepa_merged_dataset_001_e2e.yaml` |
-| 数据 | `./dataset/merged_dataset_001` |
-| Qwen3-VL-2B | `./Qwen3-VL-2B-Instruct` |
-| V-JEPA 2.1 权重 | `/cpfs_infra/shared/xiaoxinyu/VLA-JEPA/VLA-JEPA-DEV/VJEPA21/vjepa2_1_vitl_dist_vitG_384.pt` |
-
-可用环境变量覆盖：
-
-```bash
-export DATA_ROOT=/path/to/dataset          # 其下需有 merged_dataset_001/
-export BASE_VLM=/path/to/Qwen3-VL-2B-Instruct
-export VJEPA_ENCODER=/path/to/vjepa2_1_vitl_dist_vitG_384.pt
-```
-
----
-
-## 3. 启动指令
-
-在仓库根目录执行：
-
-```bash
-cd /cpfs_infra/shared/xiaoxinyu/myjepa/temp
-
-# 默认：可见 GPU 全开，每卡 batch=32，W&B online
+DATA_ROOT=/path/to/Datasets \
+BASE_VLM=/path/to/Qwen3-VL-2B-Instruct \
+VJEPA_ENCODER=/path/to/vjepa2_1_vitl_dist_vitG_384.pt \
+NUM_PROCESSES=1 BATCH_SIZE=1 NUM_WORKERS=0 WANDB_MODE=offline \
 bash scripts/vlajepa_merged_dataset_001_e2e.sh
 ```
 
-脚本实际调用：
+默认配置现在从零开始：`pretrained_checkpoint: null`、`resume_step: null`。如需加载旧权重，请同时确认旧 checkpoint 与当前新增模块的兼容性；loader 会报告 missing/unexpected keys。
+
+## 3. 单卡真实数据 Smoke Test
+
+Smoke 脚本读取一个真实 mini-batch，加载 Qwen 与 V-JEPA，执行完整前向和反向，并检查主要模块的 loss 与梯度是否为有限非零值。它不会保存 checkpoint。
 
 ```bash
-accelerate launch \
-  --config_file ./starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  --num_processes "${NUM_PROCESSES}" \
-  ./starVLA/training/train_starvla.py \
-  --config_yaml ./scripts/config/vlajepa_merged_dataset_001_e2e.yaml \
-  --run_id merged_dataset_001_e2e_vjepa21 \
-  --framework.qwenvl.base_vlm "${BASE_VLM}" \
-  --framework.vj2_model.base_encoder "${VJEPA_ENCODER}" \
-  --datasets.vla_data.data_root_dir "${DATA_ROOT}" \
-  --datasets.vla_data.per_device_batch_size "${BATCH_SIZE}" \
-  --datasets.vla_data.num_workers "${NUM_WORKERS}"
+cd temp
+
+PYTHONPATH=. python scripts/smoke_test_action_grounded.py \
+  --data-root /path/to/Datasets \
+  --base-vlm /path/to/Qwen3-VL-2B-Instruct \
+  --vjepa-encoder /path/to/vjepa2_1_vitl_dist_vitG_384.pt \
+  --batch-size 1
 ```
 
-### 常用覆盖示例
+显存紧张时可先做轻量排错：
 
 ```bash
-# 指定 GPU / 进程数 / batch（进程数不能超过可见 GPU 数）
-CUDA_VISIBLE_DEVICES=0,1,2,3 NUM_PROCESSES=4 BATCH_SIZE=8 \
-  bash scripts/vlajepa_merged_dataset_001_e2e.sh
-
-# 离线 W&B
-WANDB_MODE=offline bash scripts/vlajepa_merged_dataset_001_e2e.sh
-
-# 在线 W&B（需提前 export API key）
-export WANDB_API_KEY=xxxx
-WANDB_MODE=online bash scripts/vlajepa_merged_dataset_001_e2e.sh
+PYTHONPATH=. python scripts/smoke_test_action_grounded.py \
+  --data-root /path/to/Datasets \
+  --base-vlm /path/to/Qwen3-VL-2B-Instruct \
+  --vjepa-encoder /path/to/vjepa2_1_vitl_dist_vitG_384.pt \
+  --batch-size 1 --action-layers 2 --freeze-vlm
 ```
 
-脚本默认环境变量：
+`--action-layers` 只在内存中的 smoke 配置上临时覆盖 Action Head 深度，不修改 YAML。
 
-| 变量 | 默认 |
-|---|---|
-| `NUM_PROCESSES` | 可见 GPU 数 |
-| `BATCH_SIZE` | `32` |
-| `NUM_WORKERS` | `8` |
-| `RUN_ID` | `merged_dataset_001_e2e_vjepa21` |
-| `WANDB_MODE` | `online` |
-| `WANDB_ENTITY` | `xinyu-xiao-kinetix-ai` |
-| `WANDB_PROJECT` | `VLA_JEPA_merged_dataset_001_e2e` |
+## 4. 核心单元测试
 
----
+不加载大模型权重即可验证 Teacher 未来条件、完整动作 chunk、Knowledge Insulation 与联合梯度路径：
 
-## 4. 关键训练超参（YAML）
-
-来自 `scripts/config/vlajepa_merged_dataset_001_e2e.yaml`：
-
-- `max_train_steps`: 90000
-- `num_warmup_steps`: 1000
-- `save_interval`: 10000
-- `per_device_batch_size`: 32
-- `learning_rate`: base `3e-5` / Qwen `1e-5` / action `1e-4`
-- `lr_scheduler_type`: `cosine_with_min_lr`（`min_lr=1e-6`）
-- privileged loss：`lambda_act=1.0`, `lambda_wm=0.5`, `lambda_teacher_wm=0.1`, `lambda_distill=0.1`, `lambda_latent=0.1`
-
-当前 YAML 里还配置了从 step 20k 权重继续训练的字段（用于续跑时对齐 LR schedule）：
-
-```yaml
-trainer:
-  pretrained_checkpoint: .../steps_20000_pytorch_model.pt
-  is_resume: false
-  resume_step: 20000
+```bash
+cd temp
+PYTHONPATH=. python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-若要从零开训，请清空或注释 `pretrained_checkpoint`，并将 `resume_step` 设为 `null`。
+## 5. 默认损失权重
 
----
+| 配置 | 默认值 |
+|---|---:|
+| `lambda_act` | 1.0 |
+| `lambda_current_align` | 0.1 |
+| `lambda_student_wm` | 0.5 |
+| `lambda_teacher_wm` | 0.1 |
+| `lambda_distill` | 0.1 |
+| `lambda_ldad_gt` | 0.05 |
+| `lambda_ldad_pred` | 0.05 |
+| `lambda_latent` | 0.0 |
+| `lambda_state` | 0.0 |
 
-## 5. 产出位置
-
-```text
-checkpoints/merged_dataset_001_e2e_vjepa21/
-├── config.yaml / config.json
-├── dataset_statistics.json
-├── summary.jsonl
-├── checkpoints/
-│   ├── steps_10000_pytorch_model.pt
-│   ├── ...
-│   └── steps_90000_pytorch_model.pt
-├── final_model/
-└── wandb/
-```
-
-已完成的本次训练在 `summary.jsonl` 中记录到 `steps: 90000`。
+第一版默认启用 `knowledge_insulation` 与 `delta_action_grounding`，暂不加入 Music-JEPA temporal prior 和 Causal-JEPA object-level masking。
