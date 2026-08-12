@@ -340,6 +340,9 @@ class LeRobotSingleDataset(Dataset):
 
         # 2. Dataset statistics
         stats_path = self.dataset_path / LE_ROBOT_STATS_FILENAME
+        release_stats_path = self.dataset_path / "meta/stats.json"
+        if not stats_path.exists() and release_stats_path.exists():
+            stats_path = release_stats_path
         try:
             with open(stats_path, "r") as f:
                 le_statistics = json.load(f)
@@ -361,7 +364,7 @@ class LeRobotSingleDataset(Dataset):
                 state_action_meta = le_modality_meta.get_key_meta(f"{our_modality}.{subkey}")
                 assert isinstance(state_action_meta, LeRobotStateActionMetadata)
                 le_modality = state_action_meta.original_key
-                for stat_name in le_statistics[le_modality]:
+                for stat_name in ("max", "min", "mean", "std", "q01", "q99"):
                     indices = np.arange(
                         state_action_meta.start,
                         state_action_meta.end,
@@ -1058,7 +1061,7 @@ class LeRobotSingleDataset(Dataset):
         """
         Save dataset statistics to specified path in the required format.
         Only includes statistics for keys that are actually used in the dataset.
-        Gripper-related keys will be placed at the end.
+        Statistics follow the exact modality concatenation order used by the loader.
         
         Args:
             save_path (Path | str): Path to save the statistics file
@@ -1081,19 +1084,8 @@ class LeRobotSingleDataset(Dataset):
         if hasattr(self.metadata.statistics, 'action') and self.metadata.statistics.action:
             action_stats = self.metadata.statistics.action
             
-            # Filter to only include used action keys and reorder: non-gripper first, gripper last
-            non_gripper_keys = []
-            gripper_keys = []
-            
-            for key in action_stats.keys():
-                if key in used_action_keys:
-                    if "gripper" in key.lower():
-                        gripper_keys.append(key)
-                    else:
-                        non_gripper_keys.append(key)
-            
-            # Reorder: non-gripper first, gripper last
-            reordered_keys = non_gripper_keys + gripper_keys
+            # Match ConcatTransform exactly; dictionary/set order is not a protocol.
+            reordered_keys = [key for key in used_action_keys if key in action_stats]
             
             filtered_action_stats = {}
             for key in reordered_keys:
@@ -1115,19 +1107,7 @@ class LeRobotSingleDataset(Dataset):
         if hasattr(self.metadata.statistics, 'state') and self.metadata.statistics.state:
             state_stats = self.metadata.statistics.state
             
-            # Filter to only include used state keys, optionally reorder gripper to end
-            non_gripper_keys = []
-            gripper_keys = []
-            
-            for key in state_stats.keys():
-                if key in used_state_keys:
-                    if "gripper" in key.lower():
-                        gripper_keys.append(key)
-                    else:
-                        non_gripper_keys.append(key)
-            
-            # Reorder: non-gripper first, gripper last
-            reordered_keys = non_gripper_keys + gripper_keys
+            reordered_keys = [key for key in used_state_keys if key in state_stats]
             
             filtered_state_stats = {}
             for key in reordered_keys:
@@ -1314,7 +1294,7 @@ def combine_modality_stats(modality_stats: dict) -> dict:
 def generate_action_mask_for_used_keys(action_modalities: dict, used_action_keys_ordered) -> list[bool]:
     """
     Generate mask based on action modalities, but only for used keys.
-    Gripper-related are False, others are True.
+    Discrete gripper/binary fields are False, continuous fields are True.
     
     Args:
         action_modalities (dict): Configuration information for action modalities.
@@ -1336,31 +1316,35 @@ def generate_action_mask_for_used_keys(action_modalities: dict, used_action_keys
             else:
                 dim_count = 1
             
-            # Check if it's gripper-related
-            is_gripper = "gripper" in subkey.lower()
+            # Binary hand controls, like grippers, are already represented in
+            # their native 0/1 range and must not be linearly unnormalized.
+            normalized_subkey = subkey.lower()
+            is_discrete = "gripper" in normalized_subkey or "binary" in normalized_subkey
             
             # Generate mask value for each dimension
             for _ in range(dim_count):
-                mask.append(not is_gripper)  # gripper is False, others are True
+                mask.append(not is_discrete)
     
     return mask
 
-def get_used_modality_keys(modality_keys: dict) -> tuple[set, set]:
-    """Extract used action and state keys from modality configuration."""
-    used_action_keys = set()
-    used_state_keys = set()
+def get_used_modality_keys(modality_keys: dict) -> tuple[list[str], list[str]]:
+    """Extract action/state keys while preserving concatenation order."""
+    used_action_keys = []
+    used_state_keys = []
     
     # Extract action keys (remove "action." prefix)
     for action_key in modality_keys.get("action", []):
         if action_key.startswith("action."):
-            clean_key = action_key.replace("action.", "")
-            used_action_keys.add(clean_key)
+            clean_key = action_key.removeprefix("action.")
+            if clean_key not in used_action_keys:
+                used_action_keys.append(clean_key)
     
     # Extract state keys (remove "state." prefix)  
     for state_key in modality_keys.get("state", []):
         if state_key.startswith("state."):
-            clean_key = state_key.replace("state.", "")
-            used_state_keys.add(clean_key)
+            clean_key = state_key.removeprefix("state.")
+            if clean_key not in used_state_keys:
+                used_state_keys.append(clean_key)
     
     return used_action_keys, used_state_keys
 
@@ -1913,7 +1897,7 @@ class LeRobotMixtureDataset(Dataset):
         """
         Save merged dataset statistics to specified path in the required format.
         Only includes statistics for keys that are actually used in the datasets.
-        Gripper-related keys will be placed at the end.
+        Statistics follow the exact modality concatenation order used by the loader.
         
         Args:
             save_path (Path | str): Path to save the statistics file
@@ -1926,13 +1910,17 @@ class LeRobotMixtureDataset(Dataset):
         statistics_data = {}
         
         # Collect actually used keys from all datasets
-        all_used_action_keys = set()
-        all_used_state_keys = set()
+        all_used_action_keys = []
+        all_used_state_keys = []
         
         for dataset in self.datasets:
             used_action_keys, used_state_keys = get_used_modality_keys(dataset.modality_keys)
-            all_used_action_keys.update(used_action_keys)
-            all_used_state_keys.update(used_state_keys)
+            for key in used_action_keys:
+                if key not in all_used_action_keys:
+                    all_used_action_keys.append(key)
+            for key in used_state_keys:
+                if key not in all_used_state_keys:
+                    all_used_state_keys.append(key)
         
         # Organize statistics by tag
         for tag, merged_metadata in self.merged_metadata.items():
@@ -1942,18 +1930,7 @@ class LeRobotMixtureDataset(Dataset):
             if hasattr(merged_metadata.statistics, 'action') and merged_metadata.statistics.action:
                 action_stats = merged_metadata.statistics.action
                 
-                # Filter and reorder keys
-                non_gripper_keys = []
-                gripper_keys = []
-                
-                for key in action_stats.keys():
-                    if key in all_used_action_keys:
-                        if "gripper" in key.lower():
-                            gripper_keys.append(key)
-                        else:
-                            non_gripper_keys.append(key)
-                
-                reordered_keys = non_gripper_keys + gripper_keys
+                reordered_keys = [key for key in all_used_action_keys if key in action_stats]
                 
                 filtered_action_stats = {}
                 for key in reordered_keys:
@@ -1973,18 +1950,7 @@ class LeRobotMixtureDataset(Dataset):
             if hasattr(merged_metadata.statistics, 'state') and merged_metadata.statistics.state:
                 state_stats = merged_metadata.statistics.state
                 
-                # Filter and reorder keys
-                non_gripper_keys = []
-                gripper_keys = []
-                
-                for key in state_stats.keys():
-                    if key in all_used_state_keys:
-                        if "gripper" in key.lower():
-                            gripper_keys.append(key)
-                        else:
-                            non_gripper_keys.append(key)
-                
-                reordered_keys = non_gripper_keys + gripper_keys
+                reordered_keys = [key for key in all_used_state_keys if key in state_stats]
                 
                 filtered_state_stats = {}
                 for key in reordered_keys:
@@ -2122,6 +2088,3 @@ class LeRobotMixtureDataset(Dataset):
                 dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
         
         print(f"Applied cached statistics for {len(self.merged_metadata)} embodiment tags.")
-
-
-

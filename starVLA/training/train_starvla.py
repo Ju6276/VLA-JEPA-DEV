@@ -185,6 +185,7 @@ class VLATrainer(TrainerUtils):
         )
 
         #self._init_wandb()
+        self._init_wandb()
         self._init_checkpointing()
 
     def _calculate_total_batch_size(self):
@@ -197,7 +198,7 @@ class VLATrainer(TrainerUtils):
 
     def _init_wandb(self):
         """initialize Weights & Biases"""
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and "wandb" in self.config.get("trackers", []):
             wandb.init(
                 name=self.config.run_id,
                 dir=os.path.join(self.config.output_dir, "wandb"),
@@ -253,7 +254,8 @@ class VLATrainer(TrainerUtils):
                 metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
 
                 # record to W&B
-                #wandb.log(metrics, step=self.completed_steps)
+                if "wandb" in self.config.get("trackers", []) and wandb.run is not None:
+                    wandb.log(metrics, step=self.completed_steps)
                 # debug output
                 logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
@@ -509,8 +511,8 @@ class VLATrainer(TrainerUtils):
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
         # close W&B
-        #if self.accelerator.is_main_process:
-        #    wandb.finish()
+        if self.accelerator.is_main_process and wandb.run is not None:
+            wandb.finish()
 
         self.accelerator.wait_for_everyone()
 

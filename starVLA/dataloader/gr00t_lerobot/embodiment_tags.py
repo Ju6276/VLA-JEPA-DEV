@@ -71,4 +71,5 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     "oxe_rt1": EmbodimentTag.OXE_RT1,
     "demo_sim_franka_delta_joints": EmbodimentTag.FRANKA,
     "custom_robot_config": EmbodimentTag.NEW_EMBODIMENT,
+    "humanoidarena_sonic40": EmbodimentTag.NEW_EMBODIMENT,
 }

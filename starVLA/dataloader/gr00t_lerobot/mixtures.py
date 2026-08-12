@@ -69,5 +69,22 @@ DATASET_NAMED_MIXTURES = {
         ("BEHAVIOR_challenge", 1.0, "R1Pro"),
     ],
 
+    # HumanoidArena V3.1 protocol stored in LeRobot v2.1 containers.
+    # Keep one mixture per task for per-task benchmark training.
+    **{
+        f"humanoidarena_sonic40_{task}": [
+            (f"humanoidarena_sonic_v31_{task}", 1.0, "humanoidarena_sonic40")
+        ]
+        for task in (
+            "opendoor",
+            "double_desk",
+            "football",
+            "pp_box",
+            "boxing",
+            "sit_sofa",
+            "vision_navi",
+        )
+    },
+
 
 }

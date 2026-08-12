@@ -782,6 +782,71 @@ class SingleFrankaRobotiqDeltaJointsDataConfig:
 ###########################################################################################
 
 
+class HumanoidArenaSonic40DataConfig:
+    """HumanoidArena SONIC-only 64D-state/40D semantic reference-pose data."""
+
+    video_keys = ["video.front"]
+    state_keys = ["state.root_rot6d", "state.joint_pos", "state.joint_vel"]
+    action_keys = [
+        "action.root_xy_delta",
+        "action.root_z",
+        "action.root_rot6d",
+        "action.joint_pos",
+        "action.hand_binary",
+    ]
+    language_keys = ["annotation.human.task_description"]
+
+    def __init__(self, observation_indices, action_indices):
+        self.observation_indices = observation_indices
+        self.state_indices = [0]
+        self.action_indices = action_indices
+
+    def modality_config(self):
+        return {
+            "video": ModalityConfig(
+                delta_indices=self.observation_indices,
+                modality_keys=self.video_keys,
+            ),
+            "state": ModalityConfig(
+                delta_indices=self.state_indices,
+                modality_keys=self.state_keys,
+            ),
+            "action": ModalityConfig(
+                delta_indices=self.action_indices,
+                modality_keys=self.action_keys,
+            ),
+            "language": ModalityConfig(
+                delta_indices=[0],
+                modality_keys=self.language_keys,
+            ),
+        }
+
+    def transform(self):
+        return ComposedModalityTransform(
+            transforms=[
+                StateActionToTensor(apply_to=self.state_keys),
+                StateActionTransform(
+                    apply_to=self.state_keys,
+                    normalization_modes={key: "min_max" for key in self.state_keys},
+                ),
+                StateActionToTensor(apply_to=self.action_keys),
+                StateActionTransform(
+                    apply_to=self.action_keys,
+                    normalization_modes={
+                        "action.root_xy_delta": "min_max",
+                        "action.root_z": "min_max",
+                        "action.root_rot6d": "min_max",
+                        "action.joint_pos": "min_max",
+                        "action.hand_binary": "binary",
+                    },
+                ),
+            ]
+        )
+
+
+###########################################################################################
+
+
 
 ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig,
@@ -790,6 +855,7 @@ ROBOT_TYPE_CONFIG_MAP = {
     #"oxe_droid": OxeDroidDataConfig(),
     "oxe_bridge": OxeBridgeDataConfig,
     "oxe_rt1": OxeRT1DataConfig,
+    "humanoidarena_sonic40": HumanoidArenaSonic40DataConfig,
     #"demo_sim_franka_delta_joints": SingleFrankaRobotiqDeltaJointsDataConfig(),
     #"custom_robot_config": SingleFrankaRobotiqDeltaEefDataConfig()
 }
