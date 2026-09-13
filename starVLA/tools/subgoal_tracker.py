@@ -6,12 +6,14 @@ from __future__ import annotations
 import json
 import pickle
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence, Union
 
 import torch
 from PIL import Image
 
 from starVLA.model.modules.world_model.delta_jepa import cosine_distance
+
+GoalImage = Union[Image.Image, List[Image.Image]]
 
 
 class SubgoalTracker:
@@ -19,7 +21,7 @@ class SubgoalTracker:
 
     def __init__(
         self,
-        subgoal_images: Sequence[Image.Image],
+        subgoal_images: Sequence[GoalImage],
         z_goals: Optional[torch.Tensor] = None,
         mode: str = "sequential",
         epsilon: float = 0.15,
@@ -27,7 +29,17 @@ class SubgoalTracker:
         if len(subgoal_images) == 0:
             raise ValueError("SubgoalTracker requires at least one subgoal image")
 
-        self.subgoal_images = [image.convert("RGB") for image in subgoal_images]
+        self.subgoal_images = []
+        self.num_views = None
+        for goal in subgoal_images:
+            views = list(goal) if isinstance(goal, (list, tuple)) else [goal]
+            if not views or any(not isinstance(image, Image.Image) for image in views):
+                raise ValueError("Each subgoal must be an image or a nonempty list of camera images")
+            if self.num_views is not None and len(views) != self.num_views:
+                raise ValueError("All subgoals must contain the same number of camera views")
+            self.num_views = len(views)
+            converted = [image.convert("RGB") for image in views]
+            self.subgoal_images.append(converted[0] if isinstance(goal, Image.Image) else converted)
         self.z_goals = z_goals
         self.mode = mode
         self.epsilon = epsilon
@@ -40,14 +52,14 @@ class SubgoalTracker:
     def reset(self) -> None:
         self.current_index = 0
 
-    def current_subgoal_image(self) -> Image.Image:
+    def current_subgoal_image(self) -> GoalImage:
         return self.subgoal_images[min(self.current_index, self.num_subgoals - 1)]
 
-    def current_subgoal_images(self, batch_size: int) -> List[Image.Image]:
+    def current_subgoal_images(self, batch_size: int) -> List[GoalImage]:
         image = self.current_subgoal_image()
         return [image for _ in range(batch_size)]
 
-    def maybe_precompute_latents(self, encode_fn: Callable[[List[Image.Image]], torch.Tensor]) -> None:
+    def maybe_precompute_latents(self, encode_fn: Callable[[List[GoalImage]], torch.Tensor]) -> None:
         if self.z_goals is None:
             self.z_goals = encode_fn(self.subgoal_images)
 
@@ -87,7 +99,7 @@ class SubgoalTracker:
         subgoals_path: str,
         mode: str = "sequential",
         epsilon: float = 0.15,
-        encode_fn: Optional[Callable[[List[Image.Image]], torch.Tensor]] = None,
+        encode_fn: Optional[Callable[[List[GoalImage]], torch.Tensor]] = None,
     ) -> "SubgoalTracker":
         path = Path(subgoals_path)
         if path.is_dir():
@@ -102,7 +114,7 @@ class SubgoalTracker:
         pickle_path: Path,
         mode: str = "sequential",
         epsilon: float = 0.15,
-        encode_fn: Optional[Callable[[List[Image.Image]], torch.Tensor]] = None,
+        encode_fn: Optional[Callable[[List[GoalImage]], torch.Tensor]] = None,
     ) -> "SubgoalTracker":
         with open(pickle_path, "rb") as f:
             payload = pickle.load(f)
@@ -120,7 +132,7 @@ class SubgoalTracker:
         directory: Path,
         mode: str = "sequential",
         epsilon: float = 0.15,
-        encode_fn: Optional[Callable[[List[Image.Image]], torch.Tensor]] = None,
+        encode_fn: Optional[Callable[[List[GoalImage]], torch.Tensor]] = None,
     ) -> "SubgoalTracker":
         pickle_path = directory / "subgoals.pkl"
         if pickle_path.exists():
@@ -130,8 +142,24 @@ class SubgoalTracker:
         if manifest_path.exists():
             with open(manifest_path, "r", encoding="utf-8") as f:
                 manifest = json.load(f)
-            image_paths = [entry["path"] for entry in manifest["subgoals"]]
-            frames = [Image.open(path).convert("RGB") for path in image_paths]
+            def load_image(value):
+                image_path = Path(value)
+                # Accept manifest-relative paths and older exported paths relative
+                # to the working directory, as well as absolute paths.
+                if not image_path.is_absolute() and (directory / image_path).exists():
+                    image_path = directory / image_path
+                with Image.open(image_path) as image:
+                    return image.convert("RGB")
+
+            frames = []
+            for entry in manifest["subgoals"]:
+                if "paths" in entry:
+                    paths = entry["paths"]
+                    if not isinstance(paths, list) or not paths:
+                        raise ValueError("Subgoal manifest 'paths' must be a nonempty list of camera image paths")
+                    frames.append([load_image(path) for path in paths])
+                else:
+                    frames.append(load_image(entry["path"]))
             tracker = cls(subgoal_images=frames, mode=mode, epsilon=epsilon)
             if encode_fn is not None:
                 tracker.maybe_precompute_latents(encode_fn)

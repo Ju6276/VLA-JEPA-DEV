@@ -172,18 +172,21 @@ class baseframework(PreTrainedModel):
         return unnorm_key
 
     @_optional_instance_method
-    def get_action_stats(self, unnorm_key=None, norm_stats=None):
+    def get_action_stats(self, unnorm_key=None, norm_stats=None, *, control_interface=None):
         """
         Retrieve action statistics and the known interface normalization schema.
 
         Args:
             unnorm_key: Optional dataset stats key.
             norm_stats: Explicit statistics; required for calls on the class.
+            control_interface: Optional "simple" or "sonic" to select reference
+                deployment semantics for checkpoints with a different stats tag.
 
         Returns:
             dict: A shallow copy of the action statistics. Known SIMPLE/SONIC
                 tags include per-dimension ``normalization_modes``. An explicit
-                schema already stored in the statistics takes precedence.
+                schema already stored in the statistics takes precedence unless
+                ``control_interface`` explicitly selects a reference interface.
         """
         if norm_stats is None:
             if self is None or not hasattr(self, "norm_stats"):
@@ -191,11 +194,27 @@ class baseframework(PreTrainedModel):
             norm_stats = self.norm_stats
         unnorm_key = baseframework._check_unnorm_key(norm_stats, unnorm_key)
         action_stats = dict(norm_stats[unnorm_key]["action"])
-        if "normalization_modes" not in action_stats and unnorm_key in _ACTION_NORMALIZATION_MODES:
-            modes = _ACTION_NORMALIZATION_MODES[unnorm_key]
+        interface_tags = {"simple": "g1_handover", "sonic": "sonic_humanoid"}
+        if control_interface is not None and control_interface not in interface_tags:
+            raise ValueError("control_interface must be 'simple' or 'sonic'.")
+        schema_key = interface_tags.get(control_interface, unnorm_key)
+        if (
+            control_interface is not None or "normalization_modes" not in action_stats
+        ) and schema_key in _ACTION_NORMALIZATION_MODES:
+            modes = _ACTION_NORMALIZATION_MODES[schema_key]
             if len(action_stats["min"]) != len(modes):
                 raise ValueError(f"Action statistics for {unnorm_key} must contain {len(modes)} dimensions.")
             action_stats["normalization_modes"] = list(modes)
+            if control_interface is not None:
+                action_stats["normalization_clip_mask"] = [mode == "min_max" for mode in modes]
+            if schema_key in {"sonic_humanoid", "garbage"}:
+                # SonicStar clips every channel, then scales only mask=True
+                # channels. SIMPLE's xxy adapter does not use this mask.
+                mask = np.asarray(action_stats.get("mask", [True] * len(modes)), dtype=bool)
+                if mask.shape != (len(modes),):
+                    raise ValueError("SONIC action mask must contain 78 values.")
+                action_stats["normalization_modes"] = np.where(mask, modes, "identity").tolist()
+                action_stats.setdefault("normalization_clip_mask", [True] * len(modes))
         return action_stats
 
     @property
@@ -225,7 +244,11 @@ class baseframework(PreTrainedModel):
         Modes are min_max, mean_std, q99, binary, and identity. Explicit modes
         take precedence over ``action_norm_stats["normalization_modes"]``.
         With neither schema, legacy q01/q99 scaling and its mask are used.
-        Only q99 channels are clipped; binary conversion requires binary mode.
+        Min-max and q99 channels are clipped before scaling, matching the
+        SIMPLE xxy and SonicStar deployment adapters. Mean/std channels retain
+        their unbounded values. ``normalization_clip_mask`` can specify the
+        clipping channels explicitly (SONIC also clips unscaled mask=False
+        channels). Binary conversion requires binary mode.
 
         Args:
             normalized_actions: Array with action channels on the final axis,
@@ -257,6 +280,13 @@ class baseframework(PreTrainedModel):
         unknown = set(modes.tolist()) - {"min_max", "mean_std", "q99", "binary", "identity"}
         if unknown:
             raise ValueError(f"Unknown action normalization modes: {sorted(unknown)}")
+        clip_mask = np.asarray(
+            action_norm_stats.get("normalization_clip_mask", np.isin(modes, ["min_max", "q99"])),
+            dtype=bool,
+        )
+        if clip_mask.shape != (dimensions,):
+            raise ValueError("normalization_clip_mask must match the final action dimension.")
+        values = np.where(clip_mask, np.clip(values, -1, 1), values)
 
         def statistics(key):
             stats = np.asarray(action_norm_stats[key], dtype=values.dtype)
@@ -271,8 +301,6 @@ class baseframework(PreTrainedModel):
                 lower_key, upper_key = ("min", "max") if mode == "min_max" else ("q01", "q99")
                 low, high = statistics(lower_key)[selected], statistics(upper_key)[selected]
                 normalized = values[..., selected]
-                if mode == "q99":
-                    normalized = np.clip(normalized, -1, 1)
                 actions[..., selected] = (normalized + 1) / 2 * (high - low) + low
             elif mode == "mean_std":
                 actions[..., selected] = values[..., selected] * statistics("std")[selected] + statistics("mean")[selected]

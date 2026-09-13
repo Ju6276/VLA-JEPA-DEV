@@ -48,7 +48,15 @@ def test_interface_roundtrip_matches_actual_training_normalizers(tag, dimensions
     assert "normalization_modes" not in stats
 
     raw = torch.linspace(-3, 3, 2 * 3 * dimensions).reshape(2, 3, dimensions)
+    # Roundtrip valid min/max actions. Out-of-range deployment clipping is
+    # checked independently against the SIMPLE/SONIC source implementations.
+    minmax = np.asarray(expected_modes) == "min_max"
+    raw[..., minmax] = torch.maximum(
+        torch.minimum(raw[..., minmax], torch.tensor(stats["max"])[minmax]),
+        torch.tensor(stats["min"])[minmax],
+    )
     raw[..., 1] = 0.75
+    raw[..., 6] = torch.linspace(stats["min"][6], stats["max"][6], 6).reshape(2, 3)
     normalized = torch.empty_like(raw)
     training_inverse = torch.empty_like(raw)
     for mode in set(expected_modes):
@@ -106,7 +114,7 @@ def test_explicit_modes_override_stored_schema_and_binary_is_opt_in():
     restored = baseframework.unnormalize_actions(values, stats, ["mean_std", "binary", "identity"])
     np.testing.assert_array_equal(restored, [4.0, 1.0, -2.0])
     low, high = np.asarray(stats["min"], dtype=np.float32), np.asarray(stats["max"], dtype=np.float32)
-    expected = (values + 1) / 2 * (high - low) + low
+    expected = (np.clip(values, -1, 1) + 1) / 2 * (high - low) + low
     np.testing.assert_allclose(baseframework.unnormalize_actions(values, stats, "min_max"), expected)
 
 

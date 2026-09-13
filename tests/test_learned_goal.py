@@ -1,8 +1,10 @@
 """CPU integration checks with small backbones; no pretrained downloads needed."""
 
 import importlib
+import json
 import os
 from pathlib import Path
+import pickle
 from types import SimpleNamespace
 import subprocess
 
@@ -60,9 +62,9 @@ class TinyProcessor:
 
 
 class TinyWorldPredictor(nn.Module):
-    def __init__(self, **kwargs):
+    def __init__(self, embed_dim, action_embed_dim, **kwargs):
         super().__init__()
-        self.proj = nn.Linear(14, 6)
+        self.proj = nn.Linear(embed_dim + action_embed_dim, embed_dim)
         self.inputs = []
 
     def forward(self, x, actions):
@@ -95,7 +97,7 @@ def make_model(monkeypatch):
     monkeypatch.setattr(framework, "VisionTransformerPredictorAC", TinyWorldPredictor)
     monkeypatch.setattr(framework.VLA_JEPA, "expand_tokenizer", lambda *a, **kw: (["<action>"], [1], 2))
 
-    def build(learned=True, action_dim=3, state_dim=2, horizon=4, proposal=True):
+    def build(learned=True, action_dim=3, state_dim=2, horizon=4, proposal=True, num_views=1):
         cfg = OmegaConf.create({
             "framework": {
                 "action_model": {
@@ -103,7 +105,7 @@ def make_model(monkeypatch):
                     "state_dim": state_dim, "future_action_window_size": horizon - 1, "past_action_window_size": 0,
                 },
                 "vj2_model": {
-                    "base_encoder": "tiny", "num_video_views": 1, "num_frames": 4,
+                    "base_encoder": "tiny", "num_video_views": num_views, "num_frames": 4,
                     "depth": 1, "num_heads": 1, "special_action_token": "<action_{}>",
                     "num_action_tokens_per_timestep": 1, "num_embodied_action_tokens_per_instruction": 1,
                 },
@@ -178,7 +180,7 @@ def test_future_is_only_a_label(make_model, examples):
 
 @pytest.mark.parametrize("num_views", [1, 2, 3])
 def test_video_encoding_does_not_mix_independent_samples(make_model, num_views):
-    model = make_model(learned=False).eval()
+    model = make_model(learned=False, num_views=num_views).eval()
     videos = np.zeros((2, num_views, 4, 8, 8, 3), dtype=np.uint8)
     for sample in range(2):
         for view in range(num_views):
@@ -186,6 +188,185 @@ def test_video_encoding_does_not_mix_independent_samples(make_model, num_views):
     together = model._encode_video_batch(videos)
     separately = torch.cat([model._encode_video_batch(sample[None]) for sample in videos])
     torch.testing.assert_close(together, separately)
+
+
+@pytest.fixture
+def multiview_examples(examples):
+    samples = []
+    for sample in examples:
+        first = sample["video"][0]
+        second = np.roll(first, 1, axis=-1)
+        samples.append({
+            **sample,
+            "video": np.stack([first, second]),
+            "image": [Image.fromarray(first[0]), Image.fromarray(second[0])],
+        })
+    return samples
+
+
+def test_current_and_goal_encoding_preserve_nonfirst_camera_and_batch_identity(make_model, multiview_examples):
+    model = make_model(learned=False, num_views=2).eval()
+    images = [sample["image"] for sample in multiview_examples]
+    videos = model._images_to_video_batch(images)
+    assert videos.shape == (2, 2, 4, 8, 8, 3)
+    for sample in range(2):
+        for view in range(2):
+            np.testing.assert_array_equal(videos[sample, view, 0], np.asarray(images[sample][view]))
+    tokens = model._encode_current_images(images)
+    goals = model._encode_goal_images(images)
+    assert tokens.shape[-1] == goals.shape[-1] == 12
+    torch.testing.assert_close(tokens, torch.cat([model._encode_current_images([sample]) for sample in images]))
+    torch.testing.assert_close(goals, torch.cat([model._encode_goal_images([sample]) for sample in images]))
+    changed = [list(sample) for sample in images]
+    changed[0][1] = Image.fromarray(np.full((8, 8, 3), [170, 30, 50], dtype=np.uint8))
+    changed_tokens = model._encode_current_images(changed)
+    changed_goals = model._encode_goal_images(changed)
+    torch.testing.assert_close(changed_tokens[0, :, :6], tokens[0, :, :6])
+    assert not torch.allclose(changed_tokens[0, :, 6:], tokens[0, :, 6:])
+    assert not torch.allclose(changed_goals[0], goals[0])
+    torch.testing.assert_close(changed_tokens[1], tokens[1])
+    torch.testing.assert_close(changed_goals[1], goals[1])
+
+
+@pytest.mark.parametrize("learned,num_views", [(False, 1), (False, 2), (True, 1)])
+def test_goal_preprocessing_preserves_legacy_image_resolution(make_model, monkeypatch, learned, num_views):
+    model = make_model(learned=learned, num_views=num_views).eval()
+    shapes = []
+    processor = model.vj_processor
+
+    def record_processor(*, videos, **kwargs):
+        shapes.extend(video.shape for video in videos)
+        return processor(videos=videos, **kwargs)
+
+    monkeypatch.setattr(model, "vj_processor", record_processor)
+    images = [Image.new("RGB", (32, 24), (30 + view * 20, 90, 150)) for view in range(num_views)]
+    goals = [images[0]] if num_views == 1 else [images]
+    latent = model._encode_goal_images(goals)
+    # Current observations use 8x8 in this fixture. Only learned-goal targets
+    # should pass through that resize before the video processor.
+    expected_size = (8, 8) if learned else (24, 32)
+    assert shapes == [(4, 3, *expected_size)] * num_views
+    assert latent.shape == (1, 6 * num_views)
+
+
+@pytest.mark.parametrize("proposal", [False, True])
+def test_multiview_legacy_training_and_verifier_with_real_predictor(make_model, multiview_examples, proposal):
+    from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
+    model = make_model(learned=False, num_views=2, proposal=proposal)
+    model.vj_predictor = VisionTransformerPredictorAC(
+        img_size=(32, 32), num_frames=2, tubelet_size=1,
+        embed_dim=12, predictor_embed_dim=64, depth=1, num_heads=4,
+        action_embed_dim=8, num_add_tokens=1,
+    )
+    losses = model(multiview_examples)
+    assert all(torch.isfinite(value) for value in losses.values())
+    sum(losses.values()).backward()
+    assert model.vj_predictor.predictor_proj.weight.grad.abs().sum() > 0
+    if proposal:
+        assert "goal_proposal_loss" in losses
+        assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0
+                   for parameter in model.goal_action_proposal.parameters())
+    goals = [[Image.fromarray(sample["video"][view, -1]) for view in range(2)]
+             for sample in multiview_examples]
+    model.eval()
+    result = model.predict_action(**inference_inputs(multiview_examples), subgoal_images=goals, num_candidates=2)
+    assert result["all_candidates"].shape == (2, 2, 4, 3)
+    assert result["normalized_actions"].shape == (2, 4, 3)
+    assert result["goal_source"] == "images"
+    assert result["goal_proposal_used"] == proposal
+    assert np.isfinite(result["verification_scores"]).all()
+    for index, sample in enumerate(multiview_examples):
+        single = model.predict_action(**inference_inputs([sample]), subgoal_images=[goals[index]], num_candidates=2)
+        np.testing.assert_allclose(result["all_candidates"][index], single["all_candidates"][0], atol=1e-6)
+        np.testing.assert_allclose(result["verification_scores"][index], single["verification_scores"][0], atol=1e-6)
+
+
+def test_multiview_input_mismatch_fails_before_latent_math(make_model, multiview_examples):
+    model = make_model(learned=False, num_views=2).eval()
+    with pytest.raises(ValueError, match="exactly 2 camera views"):
+        model._encode_current_images([[sample["image"][0]] for sample in multiview_examples])
+    with pytest.raises(ValueError, match="views; expected 2"):
+        model._encode_video_batch(np.stack([sample["video"][:1] for sample in multiview_examples]))
+    with pytest.raises(ValueError, match="exactly 2 camera views"):
+        model.predict_action(**inference_inputs(multiview_examples),
+                             subgoal_images=[sample["image"][0] for sample in multiview_examples])
+    with pytest.raises(ValueError, match="one goal per observation"):
+        model.predict_action(**inference_inputs(multiview_examples), subgoal_images=[multiview_examples[0]["image"]])
+    with pytest.raises(ValueError, match="one ego video view"):
+        make_model(learned=True, num_views=2)
+
+
+def test_multiview_numpy_request_reaches_model_verifier_through_server(make_model, multiview_examples):
+    from deployment.model_server.tools import msgpack_numpy
+    from deployment.model_server.tools.websocket_policy_server import WebsocketPolicyServer
+
+    model = make_model(learned=False, num_views=2).eval()
+    request = {
+        "type": "infer", "request_id": "two-camera-goal", "payload": {
+            "batch_images": [[np.asarray(image).copy() for image in sample["image"]]
+                             for sample in multiview_examples],
+            "subgoal_images": [[sample["video"][view, -1].copy() for view in range(2)]
+                               for sample in multiview_examples],
+            "instructions": [sample["lang"] for sample in multiview_examples],
+            "state": np.stack([sample["state"] for sample in multiview_examples]),
+            "num_candidates": 2,
+        },
+    }
+    request = msgpack_numpy.unpackb(msgpack_numpy.packb(request))
+    response = WebsocketPolicyServer(model)._route_message(request)
+    response = msgpack_numpy.unpackb(msgpack_numpy.packb(response))
+    assert response["ok"], response.get("error")
+    assert response["request_id"] == "two-camera-goal"
+    output = response["data"]
+    assert output["goal_source"] == "images"
+    assert output["normalized_actions"].shape == (2, 4, 3)
+    assert output["all_candidates"].shape == (2, 2, 4, 3)
+    assert np.isfinite(output["normalized_actions"]).all()
+    assert np.isfinite(output["verification_scores"]).all()
+    assert isinstance(request["payload"]["batch_images"][1][1], np.ndarray)
+    assert isinstance(request["payload"]["subgoal_images"][1][1], np.ndarray)
+
+
+@pytest.mark.parametrize("asset_format", ["manifest", "pickle"])
+def test_multiview_tracker_assets_and_verified_inference(make_model, multiview_examples, tmp_path, asset_format):
+    goals = [sample["image"] for sample in multiview_examples]
+    if asset_format == "pickle":
+        path = tmp_path / "subgoals.pkl"
+        with path.open("wb") as stream:
+            pickle.dump({"frames": goals}, stream)
+    else:
+        entries = []
+        for index, images in enumerate(goals):
+            paths = []
+            for view, image in enumerate(images):
+                name = f"goal_{index}_view_{view}.png"
+                image.save(tmp_path / name)
+                paths.append(name)
+            entries.append({"paths": paths})
+        (tmp_path / "subgoals.json").write_text(json.dumps({"subgoals": entries}))
+        path = tmp_path
+    model = make_model(learned=False, num_views=2).eval()
+    model.load_subgoal_tracker(str(path))
+    assert model.subgoal_tracker.num_views == 2
+    assert model.subgoal_tracker.z_goals.shape == (2, 12)
+    result = model.predict_action(**inference_inputs(multiview_examples[:1]), num_candidates=2)
+    assert result["goal_source"] == "tracker"
+    assert np.isfinite(result["verification_scores"]).all()
+    single_view_model = make_model(learned=False).eval()
+    with pytest.raises(ValueError, match="assets have 2 views; model expects 1"):
+        single_view_model.load_subgoal_tracker(str(path), precompute_latents=False)
+
+
+def test_single_view_tracker_manifest_remains_supported(make_model, examples, tmp_path):
+    path = tmp_path / "goal.png"
+    examples[0]["image"][0].save(path)
+    (tmp_path / "subgoals.json").write_text(json.dumps({"subgoals": [{"path": str(path)}]}))
+    model = make_model().eval()
+    model.load_subgoal_tracker(str(tmp_path))
+    assert model.subgoal_tracker.num_views == 1
+    assert model.subgoal_tracker.z_goals.shape == (1, 6)
+    with pytest.raises(ValueError, match="assets have 1 views; model expects 2"):
+        make_model(learned=False, num_views=2).load_subgoal_tracker(str(tmp_path), precompute_latents=False)
 
 
 def test_training_backward_and_current_only_world_model(make_model, examples):

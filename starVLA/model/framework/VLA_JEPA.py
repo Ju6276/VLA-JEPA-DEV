@@ -9,7 +9,7 @@ Flow-matching header is copyright from GR00T N1.5,
 """
 from typing import List
 from tqdm import tqdm
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,6 +41,8 @@ from starVLA.model.modules.world_model.delta_jepa import (
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.tools.subgoal_tracker import SubgoalTracker
+
+GoalImage = Union[Image.Image, List[Image.Image]]
 
 @FRAMEWORK_REGISTRY.register("VLA_JEPA")
 class VLA_JEPA(baseframework):
@@ -113,6 +115,8 @@ class VLA_JEPA(baseframework):
 
         tubelet_size = self.vj_encoder.config.tubelet_size
         self.num_video_views = self.config.framework.vj2_model.get("num_video_views", 2)
+        if isinstance(self.num_video_views, bool) or not isinstance(self.num_video_views, int) or self.num_video_views < 1:
+            raise ValueError("num_video_views must be a positive integer")
         self.vj_predictor = VisionTransformerPredictorAC(
             num_frames=self.config.framework.vj2_model.num_frames//tubelet_size,
             img_size=((self.vj_encoder.config.image_size, self.vj_encoder.config.image_size)),
@@ -239,21 +243,27 @@ class VLA_JEPA(baseframework):
         tokens_per_frame = video_embeddings.shape[1] // self.num_temporal_frames
         return pool_last_temporal_frame(video_embeddings, tokens_per_frame)
 
-    def _encode_subgoal_batch(self, goal_images: List[Image.Image]) -> torch.Tensor:
+    def _encode_subgoal_batch(self, goal_images: List[GoalImage]) -> torch.Tensor:
         """Encode a list of subgoal images into pooled latents [M, D]."""
         goal_embeddings = self._encode_goal_images(goal_images)
         return goal_embeddings
 
     def load_subgoal_tracker(self, subgoals_path: str, precompute_latents: bool = True) -> None:
         """Load demo-derived subgoals for online tracking."""
-        self.subgoals_path = subgoals_path
-        encode_fn = self._encode_subgoal_batch if precompute_latents else None
-        self.subgoal_tracker = SubgoalTracker.from_path(
+        tracker = SubgoalTracker.from_path(
             subgoals_path,
             mode=self.subgoal_tracking_mode,
             epsilon=self.subgoal_epsilon,
-            encode_fn=encode_fn,
         )
+        if tracker.num_views != self.num_video_views:
+            raise ValueError(
+                f"Subgoal assets have {tracker.num_views} views; model expects {self.num_video_views}. "
+                "Provide a matching image for each configured camera at every subgoal."
+            )
+        if precompute_latents:
+            tracker.maybe_precompute_latents(self._encode_subgoal_batch)
+        self.subgoal_tracker = tracker
+        self.subgoals_path = subgoals_path
         logger.info(
             "Loaded %s subgoals from %s (mode=%s)",
             self.subgoal_tracker.num_subgoals,
@@ -337,6 +347,10 @@ class VLA_JEPA(baseframework):
 
     def _encode_video_batch(self, batch_videos: np.ndarray) -> torch.Tensor:
         """Encode a numpy video batch with the frozen V-JEPA encoder. Returns [B, N, D]."""
+        if batch_videos.ndim != 6 or batch_videos.shape[-1] != 3:
+            raise ValueError("JEPA video input must have shape [B, V, T, H, W, 3]")
+        if batch_videos.shape[1] != self.num_video_views:
+            raise ValueError(f"JEPA video input has {batch_videos.shape[1]} views; expected {self.num_video_views}")
         batch_videos = batch_videos.transpose(0, 1, 2, 5, 3, 4)  # [B, V, T, 3, H, W]
         bsz, num_views, num_frames, channels, height, width = batch_videos.shape
         flat_videos = batch_videos.reshape(bsz * num_views, num_frames, channels, height, width)
@@ -376,23 +390,43 @@ class VLA_JEPA(baseframework):
         batch_images: List[List[Image.Image]],
         num_frames: Optional[int] = None,
     ) -> np.ndarray:
-        """Convert current images into a short video clip by repeating frames."""
+        """Repeat every configured camera image, preserving [batch, view] order."""
         num_frames = num_frames or self.config.framework.vj2_model.num_frames
+        if not batch_images:
+            raise ValueError("Image batch must contain at least one sample")
         videos = []
-        for sample_images in batch_images:
-            frame = np.array(sample_images[0]).astype(np.uint8)
-            view_video = np.stack([frame] * num_frames, axis=0)  # [T, H, W, 3]
-            videos.append(view_video[None, ...])  # [1, T, H, W, 3]
-        return np.stack(videos, axis=0)  # [B, 1, T, H, W, 3]
+        frame_shape = None
+        for sample_index, sample_images in enumerate(batch_images):
+            if not isinstance(sample_images, (list, tuple)) or len(sample_images) != self.num_video_views:
+                raise ValueError(
+                    f"Image sample {sample_index} must contain exactly {self.num_video_views} camera views "
+                    "in the configured order"
+                )
+            view_videos = []
+            for image in sample_images:
+                if isinstance(image, Image.Image):
+                    image = image.convert("RGB")
+                frame = np.asarray(image, dtype=np.uint8)
+                if frame.ndim != 3 or frame.shape[-1] != 3:
+                    raise ValueError("Camera images must have shape [H, W, 3]")
+                frame_shape = frame.shape if frame_shape is None else frame_shape
+                if frame.shape != frame_shape:
+                    raise ValueError("Camera images must have matching sizes after image preprocessing")
+                view_videos.append(np.repeat(frame[None], num_frames, axis=0))
+            videos.append(np.stack(view_videos, axis=0))
+        return np.stack(videos, axis=0)  # [B, V, T, H, W, 3]
 
-    def _encode_goal_images(self, goal_images: List[Image.Image]) -> torch.Tensor:
-        """Encode subgoal images into pooled JEPA latents. Returns [B, D]."""
+    def _encode_goal_images(self, goal_images: List[GoalImage]) -> torch.Tensor:
+        """Encode [B] single-camera or [B][V] multi-camera goals to [B, V*D]."""
+        goal_batch = [list(images) if isinstance(images, (list, tuple)) else [images] for images in goal_images]
+        # Learned goals use the same image preprocessing as their current-frame
+        # inputs. Legacy priors retain their original goal images for the JEPA
+        # processor, rather than first resizing them to the VLA observation size.
         if self.use_learned_goal:
             image_size = self.config.datasets.vla_data.get("image_size", None)
             if image_size:
-                goal_images = resize_images(goal_images, target_size=image_size)
-        goal_batch = self._images_to_video_batch([[img] for img in goal_images])
-        goal_embeddings = self._encode_video_batch(goal_batch)
+                goal_batch = resize_images(goal_batch, target_size=image_size)
+        goal_embeddings = self._encode_video_batch(self._images_to_video_batch(goal_batch))
         return self._current_visual_latent(goal_embeddings)
 
     def _encode_current_images(self, batch_images: List[List[Image.Image]]) -> torch.Tensor:
@@ -431,10 +465,12 @@ class VLA_JEPA(baseframework):
         z_current: torch.Tensor,
         task_tokens: torch.Tensor,
         state: Optional[torch.Tensor],
-        subgoal_images: Optional[List[Image.Image]],
+        subgoal_images: Optional[List[GoalImage]],
     ) -> tuple[torch.Tensor, str]:
         """Use an explicit goal override, a demo tracker, or the learned goal."""
         if subgoal_images is not None:
+            if len(subgoal_images) != z_current.shape[0]:
+                raise ValueError("subgoal_images must contain one goal per observation sample")
             return self._encode_goal_images(subgoal_images), "images"
         if self.subgoal_tracker is not None:
             if z_current.shape[0] != 1:
@@ -785,7 +821,7 @@ class VLA_JEPA(baseframework):
         use_verifier: Optional[bool] = None,
         reset_subgoals: bool = False,
         num_candidates: Optional[int] = None,
-        subgoal_images: Optional[List[Image.Image]] = None,
+        subgoal_images: Optional[List[GoalImage]] = None,
         **kwargs,
     ) -> dict:
         """
@@ -845,7 +881,7 @@ class VLA_JEPA(baseframework):
         batch_images: List[List[Image.Image]],
         instructions: List[str],
         state: Optional[np.ndarray] = None,
-        subgoal_images: Optional[List[Image.Image]] = None,
+        subgoal_images: Optional[List[GoalImage]] = None,
         num_candidates: Optional[int] = None,
         **kwargs,
     ) -> dict:

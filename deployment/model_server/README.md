@@ -48,7 +48,7 @@ finally:
     client.close()
 ```
 
-SIMPLE 输出为 `[30,36]`，SONIC 输出为 `[40,78]`。执行前使用对应 checkpoint 的统计与字段变换反归一化。SIMPLE 客户端将动作提交给仿真控制接口；SONIC 客户端拆分 motion token、左手、右手三个字段后发送给控制器。
+SIMPLE 输出为 `[30,36]`，SONIC 输出为 `[40,78]`。原始 state 可通过 `control_transforms.normalize_simple_state` 或 `normalize_sonic_state` 按对应参考客户端归一化。执行前使用同一 checkpoint 的统计恢复动作：SIMPLE 前 32 维按 min-max 裁剪后缩放、后 4 维按 mean/std 缩放；SONIC 全部 78 维按其 min-max 与 mask 规则处理。完整调用见 [控制接口](../../docs/control_interfaces.md#数据统计与部署)。SIMPLE 客户端将动作提交给仿真控制接口；SONIC 客户端拆分 motion token、左手、右手三个字段后发送给控制器。
 
 ## 协议
 
@@ -93,5 +93,27 @@ SIMPLE 输出为 `[30,36]`，SONIC 输出为 `[40,78]`。执行前使用对应 c
 请求可设置 `num_candidates` 调整候选数量，或设置 `use_verifier=False` 使用普通 Action Expert 输出。普通策略响应仅包含其对应动作与条件特征字段。
 
 默认请求只需当前图像、指令和 state，subgoal latent 由模型预测。目标图片对照实验可在 payload 中增加可选字段 `subgoal_images: [uint8_RGB_image]`；每个 batch 样本对应一张目标图。服务统一转换当前图像与目标图像，显式目标优先于 tracker 与自动预测目标。省略该字段或传入 `None` 均使用默认目标来源。
+
+当前 learned-goal 配置使用单 ego 相机。已有多视角 checkpoint 的观察和显式目标使用相同的相机顺序，按 `[batch][view]` 组织：
+
+```python
+payload = {
+    "batch_images": [[current_ego, current_wrist]],
+    "subgoal_images": [[goal_ego, goal_wrist]],
+    "instructions": [task],
+    "state": normalized_state[None, None, :],
+}
+```
+
+每个样本的视角数必须与 checkpoint 的 `num_video_views` 一致。多视角 tracker 的 `subgoals.json` 用 `paths` 列出同一目标的各相机图像：
+
+```json
+{"subgoals": [
+  {"paths": ["goal0_ego.png", "goal0_wrist.png"]},
+  {"paths": ["goal1_ego.png", "goal1_wrist.png"]}
+]}
+```
+
+相对路径以 manifest 所在目录为基准；原单视角 `path` 格式继续支持。pickle 资产中的 `frames` 对应为 `[[goal0_view0, goal0_view1], ...]`。
 
 示范 tracker 可由服务参数 `--subgoals_path /path/to/subgoals` 加载，此参数会在模型构建前覆盖 checkpoint 中保存的路径。tracker 每个连接独立维护一条轨迹，仅支持 batch size 1；批量推理可使用自动目标或逐样本 `subgoal_images`。切换任务时发送 `{"type":"reset","request_id":"reset-001"}`，或调用 `client.reset()`，只重置当前连接的 tracker。新连接从第一个目标开始。
