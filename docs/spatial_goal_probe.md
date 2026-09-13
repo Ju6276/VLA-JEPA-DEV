@@ -76,6 +76,10 @@ python scripts/probe_spatial_goal.py \
 
 `--split-manifest` 保留已有来源的归属，包括留出的测试 episode；新增来源按 seed 分配。增大采样数会在每个 episode 中重新均匀选择起点。已有缓存和 manifest 不会被覆盖。小规模检查用于调试；正式实验需要更大数据量、充分训练及预先固定的评估方案。多次查看过的测试集不能当作最终论文中从未使用过的留出集。
 
+已有特征可以随数据规模扩大而复用。例如，数据集共 99 个 episode，已有的 60/10/10 划分可以扩成 79/10/10：在提取命令中设置 `--train-episodes 79 --val-episodes 10 --test-episodes 10`，加入 `--split-manifest "$PROBE_ROOT/extended/features.manifest.json" --reuse-features "$PROBE_ROOT/extended/features.pt"`，并指定新的输出路径。保持每个 episode 的采样数不变时，只编码新增来源中的样本。
+
+复用前检查编码配置、权重、源代码、数据元信息、指令与张量格式；同一样本必须保持原划分及时间位置。缓存应来自同一份未修改的数据集；更换视频或观测内容后重新提取。缓存完成校验后才发布最终文件，便于训练进程接续读取。
+
 ## 3. 比较预测器与基线
 
 所有方法在相同测试样本和冻结目标空间中评估：

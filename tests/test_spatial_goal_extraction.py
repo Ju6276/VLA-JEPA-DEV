@@ -364,3 +364,265 @@ def test_extract_batch_passes_only_current_images_to_qwen():
     assert output["valid"].dtype == torch.bool
     assert output["state"].dtype == output["ages"].dtype == torch.float32
     assert all(value.device.type == "cpu" for value in output.values())
+
+
+def make_reuse_cache():
+    model_kwargs = dict(latent_dim=8, task_dim=6, state_dim=3, grid_size=2, hidden_dim=16, num_heads=2)
+    metadata = {
+        "seed": 42,
+        "source_sha256": {"spatial_jepa.py": "source-hash"},
+        "weights": {"vjepa": {"sha256": "jepa-hash"}, "qwen": {"sha256": "qwen-hash"}},
+        "config": {"framework": {"spatial_goal": {"enabled": True, "grid_size": 2,
+                                                     "history_offsets_seconds": [-0.8, -0.4]}}},
+        "metadata_sha256": {"episodes.jsonl": "episodes-hash", "stats_gr00t.json": "stats-hash"},
+        "feature_storage_dtype": "bfloat16", "samples": {},
+    }
+    splits = {}
+    for episode, split in enumerate(("train", "val", "test")):
+        rows = []
+        group = f"dataset::session::episode_{episode:06d}"
+        for frame in (12, 14):
+            rows.append({
+                "sample_id": f"{group}::merged_{episode:06d}::frame_{frame:06d}",
+                "episode_id": group, "source_group": group, "episode_index": episode,
+                "source_dataset": "session", "source_episode_index": episode,
+                "frame_index": frame, "timestamp": frame / 10,
+                "future_frame_index": frame + 4, "future_timestamp": (frame + 4) / 10,
+                "history_frame_indices": [frame - 8, frame - 4],
+                "history_valid": [True, True], "history_ages": [0.8, 0.4],
+                "instruction": "pick up the cup",
+            })
+        metadata["samples"][split] = rows
+        splits[split] = {
+            "episode_ids": [row["episode_id"] for row in rows],
+            "sample_ids": [row["sample_id"] for row in rows],
+            "current": torch.full((2, 4, 8), float(episode), dtype=torch.bfloat16),
+            "target": torch.full((2, 4, 8), float(episode) + 0.5, dtype=torch.bfloat16),
+            "task": torch.ones(2, 2, 6, dtype=torch.bfloat16),
+            "state": torch.ones(2, 3, dtype=torch.float32),
+            "history": torch.ones(2, 2, 4, 8, dtype=torch.bfloat16),
+            "valid": torch.ones(2, 2, dtype=torch.bool),
+            "ages": torch.tensor([[0.8, 0.4], [0.8, 0.4]], dtype=torch.float32),
+        }
+    return {"schema_version": 1, "model_kwargs": model_kwargs, "metadata": metadata, "splits": splits}
+
+
+def test_compatible_frozen_feature_cache_can_be_reused():
+    cache = make_reuse_cache()
+    extraction.validate_reuse_cache(cache, copy.deepcopy(cache["metadata"]), dict(cache["model_kwargs"]))
+
+
+@pytest.mark.parametrize("field", ["seed", "source_sha256", "weights", "config", "metadata_sha256", "feature_storage_dtype"])
+def test_reuse_rejects_changes_to_encoding_provenance(field):
+    cache = make_reuse_cache()
+    requested_metadata = copy.deepcopy(cache["metadata"])
+    requested_metadata[field] = "changed"
+    with pytest.raises(ValueError):
+        extraction.validate_reuse_cache(cache, requested_metadata, cache["model_kwargs"])
+
+
+def test_reuse_rejects_different_model_dimensions():
+    cache = make_reuse_cache()
+    model_kwargs = dict(cache["model_kwargs"], grid_size=4)
+    with pytest.raises(ValueError):
+        extraction.validate_reuse_cache(cache, cache["metadata"], model_kwargs)
+
+
+@pytest.mark.parametrize("invalid", [
+    "schema", "missing_tensor", "tensor_shape", "nonfinite", "mask_dtype", "feature_dtype",
+    "state_dtype", "history_shape", "history_slot_count", "future_history_age", "duplicate_sample",
+    "cross_split_episode", "manifest_sample_order", "manifest_episode_id", "empty_task",
+])
+def test_reuse_validates_tensor_contract_and_manifest_alignment(invalid):
+    cache = make_reuse_cache()
+    split = cache["splits"]["train"]
+    if invalid == "schema":
+        cache["schema_version"] = 2
+    elif invalid == "missing_tensor":
+        del split["current"]
+    elif invalid == "tensor_shape":
+        split["target"] = split["target"][:, :3]
+    elif invalid == "nonfinite":
+        split["target"][0, 0, 0] = float("inf")
+    elif invalid == "mask_dtype":
+        split["valid"] = split["valid"].float()
+    elif invalid == "feature_dtype":
+        split["current"] = split["current"].float()
+    elif invalid == "state_dtype":
+        split["state"] = split["state"].bfloat16()
+    elif invalid == "history_shape":
+        split["history"] = split["history"][:, :1]
+    elif invalid == "history_slot_count":
+        split["history"] = torch.ones(2, 3, 4, 8, dtype=torch.bfloat16)
+        split["valid"] = torch.ones(2, 3, dtype=torch.bool)
+        split["ages"] = torch.ones(2, 3, dtype=torch.float32)
+    elif invalid == "future_history_age":
+        split["ages"][0, 0] = -1.0
+    elif invalid == "duplicate_sample":
+        split["sample_ids"][1] = split["sample_ids"][0]
+        cache["metadata"]["samples"]["train"][1]["sample_id"] = split["sample_ids"][0]
+    elif invalid == "cross_split_episode":
+        old_group = cache["splits"]["val"]["episode_ids"][0]
+        split["episode_ids"] = [old_group] * 2
+        for row in cache["metadata"]["samples"]["train"]:
+            row["episode_id"] = old_group
+    elif invalid == "manifest_sample_order":
+        cache["metadata"]["samples"]["train"].reverse()
+    elif invalid == "manifest_episode_id":
+        cache["metadata"]["samples"]["train"][0]["episode_id"] = "wrong-episode"
+    else:
+        split["task"] = split["task"][:, :0]
+    with pytest.raises(ValueError):
+        extraction.validate_reuse_cache(cache, cache["metadata"], cache["model_kwargs"])
+
+
+def test_reuse_plan_maps_exact_existing_rows_and_leaves_new_rows_for_encoding():
+    cache = make_reuse_cache()
+    plans = copy.deepcopy(cache["metadata"]["samples"])
+    for rows in plans.values():
+        for row in rows:
+            del row["instruction"]  # New plans have not decoded the instruction yet.
+    old_train = plans["train"]
+    fresh = copy.deepcopy(old_train[0])
+    fresh.update(sample_id="new-training-sample", frame_index=16, timestamp=1.6,
+                 future_frame_index=20, future_timestamp=2.0,
+                 history_frame_indices=[8, 12])
+    plans["train"] = [old_train[1], fresh, old_train[0]]
+    plans["val"] = plans["val"][1:]
+    mapping = extraction.plan_reuse(cache, plans)
+    assert mapping == {"train": {0: 1, 2: 0}, "val": {0: 1}, "test": {0: 0, 1: 1}}
+    assert cache["metadata"]["samples"]["train"][0]["instruction"] == "pick up the cup"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("timestamp", 99.0), ("frame_index", 99), ("future_frame_index", 99),
+    ("future_timestamp", 99.0), ("history_frame_indices", [1, 2]),
+    ("history_ages", [0.9, 0.5]), ("history_valid", [False, True]),
+    ("instruction", "a different task"), ("source_group", "different-source"),
+    ("episode_index", 999),
+])
+def test_reuse_rejects_changed_row_content_even_when_sample_id_matches(field, value):
+    cache = make_reuse_cache()
+    plans = copy.deepcopy(cache["metadata"]["samples"])
+    plans["train"][0][field] = value
+    with pytest.raises(ValueError):
+        extraction.plan_reuse(cache, plans)
+
+
+def test_reuse_rejects_omitted_sample_fields_except_not_yet_read_instruction():
+    cache = make_reuse_cache()
+    plans = copy.deepcopy(cache["metadata"]["samples"])
+    del plans["train"][0]["future_frame_index"]
+    with pytest.raises(ValueError):
+        extraction.plan_reuse(cache, plans)
+
+
+def test_existing_sample_cannot_be_reused_across_split_boundaries():
+    cache = make_reuse_cache()
+    plans = copy.deepcopy(cache["metadata"]["samples"])
+    plans["val"].append(plans["train"].pop(0))
+    with pytest.raises(ValueError):
+        extraction.plan_reuse(cache, plans)
+
+
+def test_new_frame_from_old_heldout_source_cannot_enter_training_with_reuse():
+    cache = make_reuse_cache()
+    plans = copy.deepcopy(cache["metadata"]["samples"])
+    new_frame = copy.deepcopy(plans["test"][0])
+    new_frame.update(sample_id="new-frame-of-old-test-episode", frame_index=20, timestamp=2.0,
+                     future_frame_index=24, future_timestamp=2.4,
+                     history_frame_indices=[12, 16])
+    plans["train"].append(new_frame)
+    replacement_test = copy.deepcopy(plans["test"][0])
+    replacement_test.update(sample_id="brand-new-test-sample", episode_id="brand-new-test-source",
+                            source_group="brand-new-test-source", episode_index=999,
+                            source_episode_index=999)
+    plans["test"] = [replacement_test]
+    with pytest.raises(ValueError):
+        extraction.plan_reuse(cache, plans)
+
+
+def test_reuse_checks_language_metadata_hash_when_recorded():
+    cache = make_reuse_cache()
+    cache["metadata"]["language_metadata_sha256"] = {"tasks.jsonl": "original-tasks-hash"}
+    metadata = copy.deepcopy(cache["metadata"])
+    extraction.validate_reuse_cache(cache, metadata, cache["model_kwargs"])
+    metadata["language_metadata_sha256"]["tasks.jsonl"] = "changed-tasks-hash"
+    with pytest.raises(ValueError, match="language metadata"):
+        extraction.validate_reuse_cache(cache, metadata, cache["model_kwargs"])
+
+
+@pytest.mark.parametrize("changed_instruction", [False, True])
+def test_reuse_rechecks_live_instruction_without_decoding_video(changed_instruction):
+    cache = make_reuse_cache()
+    plans = copy.deepcopy(cache["metadata"]["samples"])
+    for rows in plans.values():
+        for row in rows:
+            del row["instruction"]
+    mapping = extraction.plan_reuse(cache, plans)
+    reads = []
+
+    class LanguageOnlyDataset:
+        modality_keys = {"language": ["annotation.task"]}
+
+        def get_trajectory_data(self, episode):
+            reads.append(("parquet", episode))
+            return pd.DataFrame({"episode_index": [episode]})
+
+        def get_language(self, episode, key, frame):
+            assert self.curr_traj_data["episode_index"][0] == episode
+            assert key == "annotation.task"
+            reads.append(("language", episode, frame))
+            return ["changed task" if changed_instruction else "pick up the cup"]
+
+        def get_video(self, *args, **kwargs):
+            pytest.fail("Cached instruction validation must not decode video")
+
+    if changed_instruction:
+        with pytest.raises(ValueError, match="instruction changed"):
+            extraction.verify_reused_instructions(LanguageOnlyDataset(), cache, plans, mapping)
+    else:
+        count = extraction.verify_reused_instructions(LanguageOnlyDataset(), cache, plans, mapping)
+        assert count == 6
+        assert len(reads) == 12
+        assert all(row["instruction"] == "pick up the cup" for rows in plans.values() for row in rows)
+
+
+def test_feature_cache_publication_supports_safe_reload_without_temporary_files(tmp_path, monkeypatch):
+    cache = make_reuse_cache()
+    output = tmp_path / "features.pt"
+    original = extraction.validate_reuse_cache
+
+    def validate_before_publish(*args):
+        assert not output.exists()
+        original(*args)
+
+    monkeypatch.setattr(extraction, "validate_reuse_cache", validate_before_publish)
+    extraction.save_feature_cache(cache, output)
+    loaded = torch.load(output, map_location="cpu", weights_only=True)
+    original(loaded, cache["metadata"], cache["model_kwargs"])
+    for split in cache["splits"]:
+        assert loaded["splits"][split]["sample_ids"] == cache["splits"][split]["sample_ids"]
+        for field in ("current", "target", "task", "state", "history", "valid", "ages"):
+            torch.testing.assert_close(loaded["splits"][split][field], cache["splits"][split][field])
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_feature_cache_publication_never_overwrites_existing_bytes(tmp_path):
+    output = tmp_path / "features.pt"
+    original = b"previous complete experiment artifact"
+    output.write_bytes(original)
+    with pytest.raises(FileExistsError):
+        extraction.save_feature_cache(make_reuse_cache(), output)
+    assert output.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_failed_feature_cache_validation_leaves_no_partial_artifact(tmp_path):
+    cache = make_reuse_cache()
+    cache["splits"]["train"]["target"][0, 0, 0] = float("nan")
+    output = tmp_path / "features.pt"
+    with pytest.raises(ValueError, match="nonfinite"):
+        extraction.save_feature_cache(cache, output)
+    assert not output.exists()
+    assert list(tmp_path.iterdir()) == []
