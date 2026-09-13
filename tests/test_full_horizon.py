@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from starVLA.dataloader.gr00t_lerobot.datasets import (
     LeRobotMixtureDataset,
     LeRobotSingleDataset,
+    STEP_INDEX_CACHE_VERSION,
 )
 from starVLA.dataloader import lerobot_datasets
 
@@ -93,27 +94,52 @@ def test_pause_filter_is_combined_with_complete_windows(tmp_path):
     assert dataset._get_all_steps_single_process() == [(0, step) for step in range(5)]
 
 
-def test_full_horizon_never_reads_legacy_static_cache(tmp_path):
+@pytest.mark.parametrize("legacy_name", [
+    "steps_332420bad1ab.pkl", "steps_2d5a34b904d2.pkl", "steps_data_index.pkl",
+])
+def test_old_truncated_cache_does_not_override_padding_policy(tmp_path, legacy_name):
     meta = tmp_path / "meta"
     meta.mkdir()
-    legacy_steps = [(0, 7)]
-    with (meta / "steps_332420bad1ab.pkl").open("wb") as f:
-        pickle.dump({"steps": legacy_steps}, f)
-    assert make_dataset(tmp_path, full=False)._get_all_steps() == legacy_steps
-    dataset = make_dataset(tmp_path)
-    assert dataset._get_all_steps() == [(0, step) for step in range(5)]
-    # A matching cache is reused; no parquet or video needs to be read again.
-    dataset._get_all_steps_single_process = lambda: pytest.fail("valid cache was ignored")
-    assert dataset._get_all_steps() == [(0, step) for step in range(5)]
+    lengths = (100, 85)
+    # SONIC-shaped legacy indices silently excluded the last 40 starts of each
+    # episode, despite require_full_horizon=False in the current configuration.
+    legacy_steps = [(episode, step) for episode, length in enumerate(lengths) for step in range(length - 40)]
+    legacy_bytes = pickle.dumps({
+        "config_key": "9cc61c8b0718", "delete_pause_frame": False, "steps": legacy_steps,
+    })
+    (meta / legacy_name).write_bytes(legacy_bytes)
+    arguments = {"lengths": lengths, "actions": tuple(range(40)), "video": (0, 40)}
+    padded = make_dataset(tmp_path, full=False, **arguments)
+    complete = make_dataset(tmp_path, full=True, **arguments)
+    assert padded._get_all_steps() == [
+        (episode, step) for episode, length in enumerate(lengths) for step in range(length)
+    ]
+    assert complete._get_all_steps() == legacy_steps
+    assert (meta / legacy_name).read_bytes() == legacy_bytes
 
 
-def test_changing_horizon_offsets_or_episode_lengths_invalidates_cache(tmp_path):
-    original = make_dataset(tmp_path)
+def test_padded_and_complete_caches_are_separate_and_reusable(tmp_path):
+    cached_keys = set()
+    for full in (False, True):
+        dataset = make_dataset(tmp_path, full=full)
+        cached_keys.add(dataset._get_steps_config_key())
+        assert dataset._get_all_steps() == [(0, step) for step in range(5 if full else 8)]
+    assert len(cached_keys) == 2
+    for full in (True, False):
+        dataset = make_dataset(tmp_path, full=full)
+        # Matching indices are reused without reading parquet or video again.
+        dataset._get_all_steps_single_process = lambda: pytest.fail("valid cache was ignored")
+        assert dataset._get_all_steps() == [(0, step) for step in range(5 if full else 8)]
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_changing_horizon_offsets_or_episode_lengths_invalidates_cache(tmp_path, full):
+    original = make_dataset(tmp_path, full=full)
     original._get_all_steps()
     configurations = [
-        make_dataset(tmp_path, video=(0, 5)),
-        make_dataset(tmp_path, actions=tuple(range(6))),
-        make_dataset(tmp_path, lengths=(10,)),
+        make_dataset(tmp_path, video=(0, 5), full=full),
+        make_dataset(tmp_path, actions=tuple(range(6)), full=full),
+        make_dataset(tmp_path, lengths=(10,), full=full),
     ]
     for dataset in configurations:
         assert dataset._get_steps_config_key() != original._get_steps_config_key()
@@ -121,23 +147,54 @@ def test_changing_horizon_offsets_or_episode_lengths_invalidates_cache(tmp_path)
         assert dataset._get_all_steps() == expected
 
 
-def test_cache_metadata_mismatch_is_rebuilt(tmp_path):
-    dataset = make_dataset(tmp_path)
-    path = tmp_path / "meta" / f"steps_full_horizon_{dataset._get_steps_config_key()}.pkl"
+@pytest.mark.parametrize("full", [False, True])
+def test_changing_episode_ids_or_pause_filter_invalidates_cache(tmp_path, full):
+    original = make_dataset(tmp_path, full=full)
+    original._get_all_steps()
+
+    renamed = make_dataset(tmp_path, full=full)
+    renamed._trajectory_ids = np.array([5])
+    renamed.get_trajectory_data = lambda _: pd.DataFrame({"timestamp": range(8)})
+    assert renamed._get_steps_config_key() != original._get_steps_config_key()
+    assert renamed._get_all_steps() == [(5, step) for step in range(5 if full else 8)]
+
+    moving_only = make_dataset(tmp_path, full=full)
+    moving_only.delete_pause_frame = True
+    motion = np.zeros((8, 3))
+    motion[0] = 1
+    moving_only._get_position_and_gripper_values = lambda _: (motion, np.zeros(8))
+    assert moving_only._get_steps_config_key() != original._get_steps_config_key()
+    assert moving_only._get_all_steps() == [(0, 0)]
+
+
+@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize("mismatch", ["key", "missing_policy", "wrong_policy"])
+def test_cache_metadata_mismatch_is_rebuilt(tmp_path, full, mismatch):
+    dataset = make_dataset(tmp_path, full=full)
+    config_key = dataset._get_steps_config_key()
+    path = tmp_path / "meta" / f"steps_v{STEP_INDEX_CACHE_VERSION}_{config_key}.pkl"
     path.parent.mkdir()
+    cache = {"config_key": config_key, "config": dataset._get_steps_config(), "steps": [(0, 7)]}
+    if mismatch == "key":
+        cache["config_key"] = "different"
+    elif mismatch == "missing_policy":
+        del cache["config"]["require_full_horizon"]
+    else:
+        cache["config"]["require_full_horizon"] = not full
     with path.open("wb") as f:
-        pickle.dump({"config_key": "different", "steps": [(0, 7)]}, f)
-    assert dataset._get_all_steps() == [(0, step) for step in range(5)]
+        pickle.dump(cache, f)
+    assert dataset._get_all_steps() == [(0, step) for step in range(5 if full else 8)]
 
 
-def test_readonly_cache_location_still_computes_valid_windows(tmp_path, monkeypatch):
-    dataset = make_dataset(tmp_path)
+@pytest.mark.parametrize("full", [False, True])
+def test_readonly_cache_location_still_computes_valid_windows(tmp_path, monkeypatch, full):
+    dataset = make_dataset(tmp_path, full=full)
 
     def readonly(*args, **kwargs):
         raise PermissionError("dataset is read-only")
 
     monkeypatch.setattr("starVLA.dataloader.gr00t_lerobot.datasets.tempfile.NamedTemporaryFile", readonly)
-    assert dataset._get_all_steps() == [(0, step) for step in range(5)]
+    assert dataset._get_all_steps() == [(0, step) for step in range(5 if full else 8)]
 
 
 @pytest.mark.parametrize("full", [False, True])

@@ -35,7 +35,9 @@ Qwen 条件 tokens 由当前图像与指令计算。目标预测器输出的是�
 
 完整片段的动作标签覆盖 `[t, t+H)`，目标图像取 t+H。偏移由 `datasets.vla_data.video_frame_offsets` 配置；序列从 0 开始严格递增，长度与 `framework.vj2_model.num_frames` 一致。
 
-默认 `datasets.vla_data.require_full_horizon: false` 保留尾段补齐规则：越界动作使用原始零值后归一化，越界图像重复末帧，补齐动作参与训练损失。此时临近末端的目标图像时刻为 `min(t+H, episode_length-1)`。设置为 `true` 时，仅采样所有动作／视频偏移均有效的片段；这会减少尾段样本。两种选择使用独立索引缓存，修改跨度后完整片段索引自动更新。
+默认 `datasets.vla_data.require_full_horizon: false` 保留尾段补齐规则：越界动作使用原始零值后归一化，越界图像重复末帧，补齐动作参与训练损失。此时临近末端的目标图像时刻为 `min(t+H, episode_length-1)`。设置为 `true` 时，仅采样所有动作／视频偏移均有效的片段；这会减少尾段样本。两种选择均使用版本化索引缓存，根据采样策略、暂停帧过滤、动作／视频偏移和轨迹编号／长度区分并校验。配置或轨迹元数据变化时自动重建索引；缺少这些信息的旧缓存不参与读取，旧文件保持不变。数据目录只读时直接在内存中生成索引。
+
+索引重建导致每轮 batch 数变化时，完整续训会拒绝恢复旧数据位置；可使用 `trainer.pretrained_checkpoint` 加载模型权重开始新的训练。
 
 目标预测器和 proposal 的当前 latent 均来自独立当前观察编码的最后时间块；learned-goal 的逆动力学基准与部署评分使用同一个定义。
 

@@ -64,6 +64,7 @@ LE_ROBOT_INFO_FILENAME = "meta/info.json"
 LE_ROBOT_STATS_FILENAME = "meta/stats_gr00t.json"
 LE_ROBOT_DATA_FILENAME = "data/*/*.parquet"
 LE_ROBOT_STEPS_FILENAME = "meta/steps.pkl"
+STEP_INDEX_CACHE_VERSION = 2
 EPSILON = 5e-4
 
 def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
@@ -412,87 +413,22 @@ class LeRobotSingleDataset(Dataset):
         return np.array(trajectory_ids), np.array(trajectory_lengths)
 
     def _get_all_steps(self) -> list[tuple[int, int]]:
-        """Get the trajectory IDs and base indices for all steps in the dataset.
-
-        Returns:
-            list[tuple[str, int]]: A list of (trajectory_id, base_index) tuples.
-        """
-        if self.require_full_horizon:
-            return self._get_full_horizon_steps()
-
-        # Keep the existing indices and padding policy for legacy configurations.
-        # Create a hash key based on configuration to ensure cache validity
+        """Load indices only when the version and complete sampling policy match."""
+        config = self._get_steps_config()
         config_key = self._get_steps_config_key()
-        
-        # Create a unique filename based on config_key
-        steps_filename = f"steps_{config_key}.pkl"
-        # @BUG
-        # fast get static steps @fangjing --> don't use hash to dynamic sample
-        steps_filename =  "steps_data_index.pkl"
-        steps_filename = "steps_332420bad1ab.pkl"
-
-        steps_path = self.dataset_path / "meta" / steps_filename
-        
-        # Try to load cached steps first
-        try:
-            if steps_path.exists():
-                with open(steps_path, "rb") as f:
-                    cached_data = pickle.load(f)
-                return cached_data["steps"]
-            else:
-                steps_filename = "steps_2d5a34b904d2.pkl"
-                steps_path = self.dataset_path / "meta" / steps_filename
-        
-                with open(steps_path, "rb") as f:
-                    cached_data = pickle.load(f)
-                return cached_data["steps"]
-
-
-        except (FileNotFoundError, pickle.PickleError, KeyError) as e:
-            print(f"Failed to load cached steps: {e}")
-            print("Computing steps from scratch...")
-
-        # Compute steps using single process
-        all_steps = self._get_all_steps_single_process()
-        
-        # Cache the computed steps with unique filename
-        try:
-            cache_data = {
-                "config_key": config_key,
-                "steps": all_steps,
-                "num_trajectories": len(self.trajectory_ids),
-                "total_steps": len(all_steps),
-                "computed_timestamp": pd.Timestamp.now().isoformat(),
-                "delete_pause_frame": self.delete_pause_frame,
-            }
-            
-            # Ensure the meta directory exists
-            steps_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(steps_path, "wb") as f:
-                pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"Cached steps saved to {steps_path}")
-        except Exception as e:
-            print(f"Failed to cache steps: {e}")
-        
-        return all_steps
-
-    def _get_full_horizon_steps(self) -> list[tuple[int, int]]:
-        """Cache complete windows separately from the legacy padded sample indices."""
-        config_key = self._get_steps_config_key()
-        steps_path = self.dataset_path / "meta" / f"steps_full_horizon_{config_key}.pkl"
+        steps_path = self.dataset_path / "meta" / f"steps_v{STEP_INDEX_CACHE_VERSION}_{config_key}.pkl"
         all_steps = None
         try:
             with steps_path.open("rb") as f:
                 cached_data = pickle.load(f)
-            if cached_data["config_key"] == config_key:
+            if cached_data["config_key"] == config_key and cached_data["config"] == config:
                 all_steps = cached_data["steps"]
         except (OSError, EOFError, pickle.PickleError, KeyError, TypeError):
             pass
 
         if all_steps is None:
             all_steps = self._get_all_steps_single_process()
-            cache_data = {"config_key": config_key, "steps": all_steps}
+            cache_data = {"config_key": config_key, "config": config, "steps": all_steps}
             temporary_path = None
             try:
                 steps_path.parent.mkdir(parents=True, exist_ok=True)
@@ -502,38 +438,37 @@ class LeRobotSingleDataset(Dataset):
                     pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
                 os.replace(temporary_path, steps_path)
             except OSError as e:
-                print(f"Could not cache full-horizon steps in {steps_path}: {e}")
+                print(f"Could not cache sample indices in {steps_path}: {e}")
             finally:
                 if temporary_path is not None:
                     temporary_path.unlink(missing_ok=True)
 
-        if not all_steps:
+        if self.require_full_horizon and not all_steps:
             raise ValueError(
                 f"Dataset {self.dataset_name} has no valid samples with require_full_horizon=True. "
                 "Check episode lengths, action/video offsets, and delete_pause_frame."
             )
         return all_steps
 
-    def _get_steps_config_key(self) -> str:
-        """Generate a configuration key for steps caching."""
-        config_dict = {
+    def _get_steps_config(self) -> dict:
+        """Sampling inputs shared by the cache filename and its validation metadata."""
+        return {
+            "version": STEP_INDEX_CACHE_VERSION,
             "delete_pause_frame": self.delete_pause_frame,
+            "require_full_horizon": self.require_full_horizon,
             "dataset_name": self.dataset_name,
+            "delta_indices": {
+                key: offsets.tolist() for key, offsets in sorted(self.delta_indices.items())
+            },
+            "trajectories": list(zip(
+                self.trajectory_ids.tolist(), self.trajectory_lengths.tolist()
+            )),
         }
-        if self.require_full_horizon:
-            config_dict.update({
-                "full_horizon_version": 1,
-                "require_full_horizon": True,
-                "delta_indices": {
-                    key: offsets.tolist() for key, offsets in sorted(self.delta_indices.items())
-                },
-                "trajectories": list(zip(
-                    self.trajectory_ids.tolist(), self.trajectory_lengths.tolist()
-                )),
-            })
-        # Create a hash of the configuration
-        config_str = str(sorted(config_dict.items()))
-        return hashlib.md5(config_str.encode()).hexdigest()[:12]  #
+
+    def _get_steps_config_key(self) -> str:
+        """Generate a configuration key for either padded or complete-window samples."""
+        config_str = json.dumps(self._get_steps_config(), sort_keys=True, separators=(",", ":"))
+        return hashlib.md5(config_str.encode()).hexdigest()[:12]
 
     def _valid_step_range(self, trajectory_length: int) -> range:
         """Bounds include every requested action/video offset, including history."""
@@ -2230,4 +2165,3 @@ class LeRobotMixtureDataset(Dataset):
                 dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
         
         print(f"Applied cached statistics for {len(self.merged_metadata)} embodiment tags.")
-
