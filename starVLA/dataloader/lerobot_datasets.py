@@ -17,6 +17,7 @@ def make_LeRobotSingleDataset(
     delete_pause_frame: bool = False,
     action_horizon: int = 7,
     video_horizon: int = 16,
+    video_frame_offsets: Sequence[int] | None = None,
 ) -> LeRobotSingleDataset:
     """
     Make a LeRobotSingleDataset object.
@@ -27,9 +28,16 @@ def make_LeRobotSingleDataset(
     :param crop_obs_camera: Whether to crop the observation camera images.
     :return: A LeRobotSingleDataset object.
     """
+    observation_indices = list(range(video_horizon)) if video_frame_offsets is None else list(video_frame_offsets)
+    if len(observation_indices) != video_horizon:
+        raise ValueError("video_frame_offsets must contain exactly vj2_model.num_frames entries")
+    if not observation_indices or observation_indices[0] != 0 or any(
+        b <= a for a, b in zip(observation_indices, observation_indices[1:])
+    ):
+        raise ValueError("video_frame_offsets must start at zero and increase strictly")
     data_config_cls = ROBOT_TYPE_CONFIG_MAP[robot_type]
     data_config = data_config_cls(
-        observation_indices=list(range(video_horizon)),
+        observation_indices=observation_indices,
         action_indices=list(range(action_horizon))
     )
     modality_config = data_config.modality_config()
@@ -84,7 +92,8 @@ def get_vla_dataset(
                                                           robot_type, 
                                                           delete_pause_frame=delete_pause_frame, 
                                                           action_horizon=action_horizon,
-                                                          video_horizon=video_horizon), d_weight))
+                                                          video_horizon=video_horizon,
+                                                          video_frame_offsets=data_cfg.get("video_frame_offsets", None)), d_weight))
 
     return LeRobotMixtureDataset(
         dataset_mixture,

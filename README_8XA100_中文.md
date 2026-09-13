@@ -1,111 +1,70 @@
-# G1 Pick Between Tables：8×A100 训练步骤
+# 8×A100 训练指南
 
-## 1. 进入仓库并激活环境
+[主 README](README.md) · [方法](docs/learned_goals.md) · [控制接口](docs/control_interfaces.md)
+
+## 1. 环境与数据
+
+按主 README 安装环境，准备 Qwen3-VL-2B-Instruct、V-JEPA 2.1 ViT-L 384px 和对应的 LeRobot 数据集。
 
 ```bash
-cd /path/to/VLA-JEPA-DEV
 conda activate VLA_JEPA
-pip install -r requirements.txt
-pip install flash-attn --no-build-isolation
-pip install -e .
-```
-
-## 2. 准备文件
-
-需要以下三个路径：
-
-```text
-/path/to/data_root/
-└── dataset/G1WholebodyLocomotionPickBetweenTablesTeleop-v0/
-
-/path/to/vjepa2_1_vitl_dist_vitG_384.pt
-
-/path/to/subgoals/
-```
-
-`/path/to/subgoals/` 必须是 `--method jepa_change` 生成的 subgoal 目录或 pkl。
-
-如果尚未抽取 subgoal：
-
-```bash
-export LEROBOT_DATASET="${DATA_ROOT}/dataset/G1WholebodyLocomotionPickBetweenTablesTeleop-v0"
-export SUBGOALS_PATH=/path/to/subgoals
-
-python -m starVLA.tools.extract_subgoals \
-  --lerobot_dataset "${LEROBOT_DATASET}" \
-  --episode_index 0 \
-  --output_dir "${SUBGOALS_PATH}" \
-  --encoder_path "${VJEPA21_CKPT}" \
-  --method jepa_change \
-  --num_subgoals 5 \
-  --image_key observation.images.rs_view \
-  --frame_stride 5 \
-  --device cuda
-```
-
-## 3. 设置训练路径
-
-```bash
-export DATA_ROOT=/path/to/data_root
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export NUM_PROCESSES=8
 export VJEPA21_CKPT=/path/to/vjepa2_1_vitl_dist_vitG_384.pt
-export SUBGOALS_PATH=/path/to/subgoals
 export QWEN_MODEL=Qwen/Qwen3-VL-2B-Instruct
 export OUTPUT_ROOT=/path/to/checkpoints
+export WANDB_MODE=offline
 ```
 
-默认使用离线 W&B。需要在线记录时执行：
+在线 W&B 记录可通过 `wandb login` 配置凭据，再设置 `WANDB_MODE=online`。
+
+## 2. 选择控制接口
+
+| 参数 | SIMPLE | SONIC |
+|---|---|---|
+| state / action | 32 / 36 | 46 / 78 |
+| action horizon | 30 | 40 |
+| 每卡 batch | 32 | 4 |
+| 全局 batch，梯度累积为 1 | 256 | 32 |
+| 目标偏移 | t+30 | t+40 |
+
+SIMPLE 的 `DATA_ROOT` 下包含 `dataset/G1WholebodyLocomotionPickBetweenTablesTeleop-v0/`：
 
 ```bash
-export WANDB_MODE=online
-export WANDB_API_KEY=你的密钥
-```
-
-## 4. 启动 8 卡训练
-
-```bash
+export DATA_ROOT=/path/to/sim_data_root
 bash scripts/train_g1_delta_jepa_8xa100.sh
 ```
 
-默认配置：
-
-```text
-GPU：8×A100
-精度：BF16
-并行：DeepSpeed ZeRO-2
-单卡 batch size：32
-梯度累积：1
-全局 batch size：256
-V-JEPA：V-JEPA 2.1 ViT-L 384px
-训练 loss：action + wm + delta + ctrl + action_prior + goal_proposal
-Delta-JEPA：开启
-subgoal：开启
-verifier：默认开启
-候选动作数：8
-动作候选：1 个 goal-conditioned proposal + 7 个 Action Expert 采样
-```
-
-显存不足时：
+SONIC 的 `DATA_ROOT` 下包含 `merged_dataset_001/`：
 
 ```bash
-PER_DEVICE_BATCH_SIZE=2 bash scripts/train_g1_delta_jepa_8xa100.sh
+export DATA_ROOT=/path/to/sonic_data_root
+bash scripts/train_sonic_learned_goal.sh
 ```
 
-修改训练步数或保存间隔：
+两个启动脚本共用 BF16、DeepSpeed ZeRO-2 和自动目标预测训练流程，各自选择对应的模型维度、数据配置及输出 run_id。
+
+## 3. 调整训练参数
 
 ```bash
-bash scripts/train_g1_delta_jepa_8xa100.sh \
+PER_DEVICE_BATCH_SIZE=2 bash scripts/train_sonic_learned_goal.sh \
   --trainer.max_train_steps 40000 \
   --trainer.save_interval 5000
 ```
 
-## 5. 检查训练输出
+启动器支持 `NUM_PROCESSES`、`PER_DEVICE_BATCH_SIZE`、`NUM_WORKERS`、`OUTPUT_ROOT`、`RUN_ID` 和 `QWEN_MODEL`。命令末尾的配置覆盖参数直接传给训练入口。
 
-```bash
-ls "${OUTPUT_ROOT}/g1_pick_between_tables_delta_jepa_8xa100"
-tail -f "${OUTPUT_ROOT}/g1_pick_between_tables_delta_jepa_8xa100/summary.jsonl"
+## 4. 输出与日志
+
+默认输出目录：
+
+```text
+checkpoints/
+├── g1_pick_between_tables_delta_jepa_8xa100/
+└── sonic_latent_learned_goal/
 ```
 
-日志中每个训练 step 应包含：
+每个 run 保存配置、`dataset_statistics.json`、`summary.jsonl` 和 `checkpoints/`。日志包含：
 
 ```text
 action_loss
@@ -114,24 +73,21 @@ delta_loss
 ctrl_loss
 action_prior_loss
 goal_proposal_loss
+goal_prediction_loss
 ```
 
-## 6. 启动默认 verifier 推理
+查看 SONIC 日志：
+
+```bash
+tail -f "${OUTPUT_ROOT}/sonic_latent_learned_goal/summary.jsonl"
+```
+
+## 5. 启动推理服务
 
 ```bash
 python -m deployment.model_server.server_policy \
-  --ckpt_path "${OUTPUT_ROOT}/g1_pick_between_tables_delta_jepa_8xa100/checkpoints/steps_40000_pytorch_model.pt" \
-  --cuda 0 \
-  --use_bf16 \
-  --port 10093
+  --ckpt_path "${OUTPUT_ROOT}/sonic_latent_learned_goal/checkpoints/steps_40000_pytorch_model.pt" \
+  --cuda 0 --use_bf16 --port 10093
 ```
 
-checkpoint 保存的配置已经包含：
-
-```text
-delta_jepa.enabled=true
-delta_jepa.use_verifier=true
-delta_jepa.subgoals_path=<训练时的 SUBGOALS_PATH>
-```
-
-因此不需要额外添加 `--use_verifier` 或 `--subgoals_path`。
+SIMPLE 使用对应 run 目录中的 checkpoint。模型配置默认开启自动目标和 verifier，每次请求输入当前 ego 图像、指令与归一化 state。客户端按该 run 的数据统计恢复动作，并通过对应控制器执行，详见 [部署文档](deployment/model_server/README.md)。

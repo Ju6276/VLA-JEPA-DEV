@@ -33,6 +33,7 @@ from starVLA.model.modules.world_model.delta_jepa import (
     CandidateActionEncoder,
     GoalConditionedActionProposal,
     LatentInverseDynamics,
+    LatentGoalPredictor,
     latent_progress_score,
     pool_last_temporal_frame,
     pool_vjepa_tokens,
@@ -141,6 +142,14 @@ class VLA_JEPA(baseframework):
             delta_cfg.get("goal_action_proposal_enabled", False)
         )
         self.lambda_goal_proposal = float(delta_cfg.get("lambda_goal_proposal", 0.01))
+        # Opt-in preserves the architecture/loading of existing checkpoints.
+        self.use_learned_goal = bool(delta_cfg.get("learned_goal_enabled", False))
+        self.lambda_goal_prediction = float(delta_cfg.get("lambda_goal_prediction", 0.05))
+        self.goal_proposal_predicted_weight = float(delta_cfg.get("goal_proposal_predicted_weight", 0.5))
+        if not 0.0 <= self.goal_proposal_predicted_weight <= 1.0:
+            raise ValueError("goal_proposal_predicted_weight must be in [0, 1]")
+        if self.use_learned_goal and (not self.use_delta_jepa or self.num_video_views != 1):
+            raise ValueError("learned_goal_enabled requires delta_jepa.enabled=true and one ego video view")
         self.ctrl_action_step = delta_cfg.get("ctrl_action_step", "first")
         self.verifier_num_candidates = int(delta_cfg.get("verifier_num_candidates", 8))
         self.use_verifier_default = bool(delta_cfg.get("use_verifier", False))
@@ -149,6 +158,8 @@ class VLA_JEPA(baseframework):
         self.subgoals_path = delta_cfg.get("subgoals_path", None)
 
         self.num_temporal_frames = self.config.framework.vj2_model.num_frames // tubelet_size
+        if self.use_learned_goal and self.num_temporal_frames < 2:
+            raise ValueError("Learned goals require at least two temporal JEPA blocks")
         self.num_predictor_action_tokens = max(
             1,
             (self.num_temporal_frames - 1)
@@ -180,6 +191,10 @@ class VLA_JEPA(baseframework):
                 hidden_dim=hidden_dim,
                 num_layers=int(delta_cfg.get("action_prior_num_layers", 2)),
             )
+            self.goal_predictor = (
+                LatentGoalPredictor(jepa_embed_dim, vlm_hidden_dim, state_dim, hidden_dim)
+                if self.use_learned_goal else None
+            )
             self.goal_action_proposal = (
                 GoalConditionedActionProposal(
                     latent_dim=jepa_embed_dim,
@@ -204,6 +219,7 @@ class VLA_JEPA(baseframework):
             self.inv_dyn_decoder = None
             self.action_dynamics_prior = None
             self.goal_action_proposal = None
+            self.goal_predictor = None
 
         self.subgoal_tracker: Optional[SubgoalTracker] = None
         if self.subgoals_path:
@@ -315,13 +331,14 @@ class VLA_JEPA(baseframework):
             device=encoder_param.device,
             dtype=encoder_param.dtype,
         )
-        use_cuda_autocast = (
-            encoder_param.is_cuda
-            and encoder_param.dtype in (torch.float16, torch.bfloat16)
+        # Preserve the trainer's autocast even when model parameters stay FP32.
+        autocast_dtype = (
+            torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else encoder_param.dtype
         )
+        use_cuda_autocast = encoder_param.is_cuda and autocast_dtype in (torch.float16, torch.bfloat16)
         with torch.no_grad(), torch.autocast(
             device_type="cuda",
-            dtype=encoder_param.dtype,
+            dtype=autocast_dtype,
             enabled=use_cuda_autocast,
         ):
             video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
@@ -345,10 +362,60 @@ class VLA_JEPA(baseframework):
 
     def _encode_goal_images(self, goal_images: List[Image.Image]) -> torch.Tensor:
         """Encode subgoal images into pooled JEPA latents. Returns [B, D]."""
+        if self.use_learned_goal:
+            image_size = self.config.datasets.vla_data.get("image_size", None)
+            if image_size:
+                goal_images = resize_images(goal_images, target_size=image_size)
         goal_batch = self._images_to_video_batch([[img] for img in goal_images])
         goal_embeddings = self._encode_video_batch(goal_batch)
         tokens_per_frame = max(1, goal_embeddings.shape[1] // self.num_temporal_frames)
         return pool_vjepa_tokens(goal_embeddings[:, -tokens_per_frame:, :])
+
+    def _encode_training_goal_pair(
+        self,
+        batch_images: List[List[Image.Image]],
+        batch_videos: np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode current observations and terminal targets in separate passes.
+
+        The video is [B, 1, T, H, W, C]. Only its last frame supplies a training
+        label. Never split a jointly encoded current/future clip into inputs:
+        the bidirectional encoder would leak future information into the input.
+        Repeat single images exactly as in verified deployment.
+        """
+        if batch_videos.ndim != 6 or batch_videos.shape[1] != 1 or batch_videos.shape[2] < 2:
+            raise ValueError("Learned goals need [B, 1, T>=2, H, W, C] demonstration videos")
+        target_images = [[Image.fromarray(video[0, -1].astype(np.uint8))] for video in batch_videos]
+        image_size = self.config.datasets.vla_data.get("image_size", None)
+        if image_size:
+            batch_images = resize_images(batch_images, target_size=image_size)
+            target_images = resize_images(target_images, target_size=image_size)
+        current_tokens = self._encode_video_batch(self._images_to_video_batch(batch_images))
+        target_tokens = self._encode_video_batch(self._images_to_video_batch(target_images))
+        tokens_per_frame = target_tokens.shape[1] // self.num_temporal_frames
+        return current_tokens, target_tokens[:, -tokens_per_frame:]
+
+    def _resolve_verifier_goal(
+        self,
+        z_current: torch.Tensor,
+        task_tokens: torch.Tensor,
+        state: Optional[torch.Tensor],
+        subgoal_images: Optional[List[Image.Image]],
+    ) -> tuple[torch.Tensor, str]:
+        """Use an explicit goal override, a demo tracker, or the learned goal."""
+        if subgoal_images is not None:
+            return self._encode_goal_images(subgoal_images), "images"
+        if self.subgoal_tracker is not None:
+            self.subgoal_tracker.maybe_precompute_latents(self._encode_subgoal_batch)
+            self.subgoal_tracker.update(z_current[0] if z_current.shape[0] == 1 else z_current)
+            images = self.subgoal_tracker.current_subgoal_images(z_current.shape[0])
+            return self._encode_goal_images(images), "tracker"
+        if self.goal_predictor is not None:
+            return self.goal_predictor(z_current, task_tokens, state), "predicted"
+        raise ValueError(
+            "Verifier needs subgoal_images/subgoals_path or a checkpoint trained with "
+            "framework.delta_jepa.learned_goal_enabled=true"
+        )
 
     def _predict_future_latent(
         self,
@@ -509,7 +576,6 @@ class VLA_JEPA(baseframework):
 
         #[print(each.shape, end=";") for each in batch_videos]
         batch_videos = np.stack(batch_videos)  #  [B, V, T, H, W, 3]
-        batch_videos = batch_videos.transpose(0,1,2,5,3,4)  # [B, V, T, 3, H, W]
 
         # Step 1: QWenVL input format
         if actions is not None:
@@ -549,21 +615,27 @@ class VLA_JEPA(baseframework):
             #exit()
         
             # Step 2: JEPA Encoder
-            B, V, T, C, H, W = batch_videos.shape
-            batch_videos = batch_videos.reshape(B*V, T, C, H, W)  # [B*V, T, C, H, W]
-            input_videos = self.vj_processor(
-                videos=[batch_videos[i] for i in range(B*V)], return_tensors="pt"
-            )["pixel_values_videos"].to(self.vj_encoder.device)  # [B*V, T, C, H, W]
-            with torch.no_grad():
-                video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
-                video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=V, dim=0), dim=2)
+            learned_goal_training = self.use_learned_goal and actions is not None
+            if learned_goal_training:
+                video_embeddings, goal_target_tokens = self._encode_training_goal_pair(batch_images, batch_videos)
+                T = self.num_temporal_frames
+            else:
+                batch_videos = batch_videos.transpose(0, 1, 2, 5, 3, 4)
+                B, V, T, C, H, W = batch_videos.shape
+                batch_videos = batch_videos.reshape(B * V, T, C, H, W)
+                input_videos = self.vj_processor(
+                    videos=[batch_videos[i] for i in range(B * V)], return_tensors="pt"
+                )["pixel_values_videos"].to(self.vj_encoder.device)
+                with torch.no_grad():
+                    video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
+                    video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=V, dim=0), dim=2)
+                T = T // self.vj_encoder.config.tubelet_size
             #print(video_embeddings.shape) # [B, T//tubelet_size * dim_per_frame, V*embed_dim]
         
             # Step 3: VJ Predictor
-            T = T // self.vj_encoder.config.tubelet_size
             tokens_per_step = video_embeddings.shape[1] // T
             input_states = video_embeddings[:, :-tokens_per_step, :]
-            gt_states = video_embeddings[:, tokens_per_step:, :]
+            gt_states = goal_target_tokens if learned_goal_training else video_embeddings[:, tokens_per_step:, :]
 
             action_cond = action_tokens
             actions_tensor = None
@@ -580,8 +652,12 @@ class VLA_JEPA(baseframework):
                 input_states,
                 action_cond
             )
+            if learned_goal_training:
+                # Train the same current-only rollout used at deployment, and
+                # compare its endpoint to the independently encoded endpoint.
+                predicted_states = predicted_states[:, -tokens_per_step:]
 
-            teacher_forcing_wm_loss = F.l1_loss(
+            world_model_loss = F.l1_loss(
                 predicted_states,
                 gt_states,
                 reduction="mean"
@@ -589,7 +665,7 @@ class VLA_JEPA(baseframework):
         
         if "action" not in examples[0]:
             wm_weight = self.lambda_wm if self.use_delta_jepa else 1.0
-            return {"wm_loss": teacher_forcing_wm_loss * wm_weight}
+            return {"wm_loss": world_model_loss * wm_weight}
 
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
@@ -619,7 +695,7 @@ class VLA_JEPA(baseframework):
         wm_weight = self.lambda_wm if self.use_delta_jepa else 0.1
         output = {
             "action_loss": action_loss,
-            "wm_loss": teacher_forcing_wm_loss * wm_weight,
+            "wm_loss": world_model_loss * wm_weight,
         }
 
         if self.use_delta_jepa:
@@ -637,21 +713,34 @@ class VLA_JEPA(baseframework):
                 self.action_dynamics_prior.loss(actions_target, state_tensor)
                 * self.lambda_action_prior
             )
-            if self.goal_action_proposal is not None:
+            if self.goal_action_proposal is not None or self.goal_predictor is not None:
                 proposal_z_current = pool_last_temporal_frame(
                     input_states,
                     tokens_per_step,
                 )
                 proposal_z_goal = pool_vjepa_tokens(gt_states)
-                output["goal_proposal_loss"] = (
-                    self.goal_action_proposal.loss(
+                predicted_goal = None
+                if self.goal_predictor is not None:
+                    predicted_goal = self.goal_predictor(
+                        proposal_z_current.detach(), embodied_action_tokens, state_tensor
+                    )
+                    output["goal_prediction_loss"] = (
+                        1.0 - F.cosine_similarity(predicted_goal.float(), proposal_z_goal.detach().float(), dim=-1)
+                    ).mean() * self.lambda_goal_prediction
+                if self.goal_action_proposal is not None:
+                    proposal_loss = self.goal_action_proposal.loss(
                         proposal_z_current.detach(),
                         proposal_z_goal.detach(),
                         state_tensor,
                         actions_target,
                     )
-                    * self.lambda_goal_proposal
-                )
+                    if predicted_goal is not None:
+                        predicted_goal_loss = self.goal_action_proposal.loss(
+                            proposal_z_current.detach(), predicted_goal.detach(), state_tensor, actions_target
+                        )
+                        weight = self.goal_proposal_predicted_weight
+                        proposal_loss = (1.0 - weight) * proposal_loss + weight * predicted_goal_loss
+                    output["goal_proposal_loss"] = proposal_loss * self.lambda_goal_proposal
 
         return output
 
@@ -741,20 +830,13 @@ class VLA_JEPA(baseframework):
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
 
-        num_candidates = num_candidates or self.verifier_num_candidates
+        num_candidates = self.verifier_num_candidates if num_candidates is None else num_candidates
+        if num_candidates < 1:
+            raise ValueError("num_candidates must be at least 1")
         video_batch = self._images_to_video_batch(batch_images)
         video_embeddings = self._encode_video_batch(video_batch)
         tokens_per_frame = max(1, video_embeddings.shape[1] // self.num_temporal_frames)
         z_current = pool_last_temporal_frame(video_embeddings, tokens_per_frame)
-
-        if self.subgoal_tracker is not None:
-            self.subgoal_tracker.maybe_precompute_latents(self._encode_subgoal_batch)
-            self.subgoal_tracker.update(z_current[0] if z_current.shape[0] == 1 else z_current)
-            subgoal_images = self.subgoal_tracker.current_subgoal_images(len(batch_images))
-        elif subgoal_images is None:
-            raise ValueError(
-                "subgoal_images is required unless framework.delta_jepa.subgoals_path is configured"
-            )
 
         action_tokens, embodied_action_tokens = self._get_vlm_action_tokens(
             batch_images=batch_images,
@@ -768,7 +850,9 @@ class VLA_JEPA(baseframework):
             else None
         )
 
-        z_goal = self._encode_goal_images(subgoal_images)
+        z_goal, goal_source = self._resolve_verifier_goal(
+            z_current, embodied_action_tokens, state_tensor, subgoal_images
+        )
 
         if self.goal_action_proposal is not None:
             proposal = self.goal_action_proposal(
@@ -804,7 +888,10 @@ class VLA_JEPA(baseframework):
             candidate_chunk = candidates[:, idx]
             candidate_cond = self._build_predictor_action_cond(action_tokens, candidate_chunk)
             _, _, predicted_states = self._predict_future_latent(video_embeddings, candidate_cond)
-            z_predicted = pool_vjepa_tokens(predicted_states)
+            z_predicted = (
+                pool_last_temporal_frame(predicted_states, tokens_per_frame)
+                if self.use_learned_goal else pool_vjepa_tokens(predicted_states)
+            )
             goal_progress = latent_progress_score(z_current, z_predicted, z_goal)
             action_prior_error = self.action_dynamics_prior.energy(
                 candidate_chunk,
@@ -819,10 +906,11 @@ class VLA_JEPA(baseframework):
             best_actions = torch.where(better.unsqueeze(-1).unsqueeze(-1), candidate_chunk, best_actions)
 
         return {
-            "normalized_actions": best_actions.detach().cpu().numpy(),
-            "verification_scores": best_scores.detach().cpu().numpy(),
-            "all_candidates": candidates.detach().cpu().numpy(),
+            "normalized_actions": best_actions.float().cpu().numpy(),
+            "verification_scores": best_scores.float().cpu().numpy(),
+            "all_candidates": candidates.float().cpu().numpy(),
             "goal_proposal_used": self.goal_action_proposal is not None,
+            "goal_source": goal_source,
             "subgoal_index": (
                 self.subgoal_tracker.current_index if self.subgoal_tracker is not None else None
             ),

@@ -176,6 +176,43 @@ class ActionDynamicsPrior(nn.Module):
         return error.mean(dim=(1, 2))
 
 
+class LatentGoalPredictor(nn.Module):
+    """Predict a near-future visual goal from deployable observation/task inputs.
+
+    ``task_tokens`` are Qwen's image/instruction-conditioned hidden states, not
+    ground-truth actions. The output lives in the frozen JEPA feature space.
+    """
+
+    def __init__(self, latent_dim: int, task_dim: int, state_dim: int, hidden_dim: int = 512):
+        super().__init__()
+        self.state_dim = state_dim
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim + task_dim + state_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+
+    def forward(
+        self,
+        z_current: torch.Tensor,
+        task_tokens: torch.Tensor,
+        state: torch.Tensor | None,
+    ) -> torch.Tensor:
+        param = next(self.parameters())
+        z_current = z_current.to(device=param.device, dtype=param.dtype)
+        task = task_tokens.to(device=param.device, dtype=param.dtype).mean(dim=1)
+        if state is None:
+            state = z_current.new_zeros(z_current.shape[0], self.state_dim)
+        else:
+            if state.dim() == 3:
+                state = state[:, -1]
+            state = state.to(device=param.device, dtype=param.dtype)
+        return F.normalize(self.net(torch.cat([z_current, task, state], dim=-1)), dim=-1)
+
+
 class GoalConditionedActionProposal(nn.Module):
     """Amortized action proposal conditioned on current and goal JEPA states."""
 

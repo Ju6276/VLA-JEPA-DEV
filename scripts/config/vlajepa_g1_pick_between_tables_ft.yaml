@@ -61,6 +61,9 @@ framework:
     verifier_action_prior_weight: 0.1
     goal_action_proposal_enabled: true
     lambda_goal_proposal: 0.01
+    learned_goal_enabled: true
+    lambda_goal_prediction: 0.05
+    goal_proposal_predicted_weight: 0.5
     ctrl_action_step: first
     hidden_dim: 512
     verifier_num_candidates: 8
@@ -82,6 +85,7 @@ datasets:
     image_size: [224, 224]
     per_device_batch_size: 32
     video_resolution_size: 256
+    video_frame_offsets: [0, 4, 8, 12, 16, 20, 24, 30]
     load_all_data_for_training: true
     with_state: true
     delete_pause_frame: false

@@ -1,218 +1,212 @@
-<h3 align="center" style="font-size:48px; font-weight:bold; color:#9C276A; margin: 0;">
-  <a href="https://arxiv.org/abs/2602.10098" style="color:#9C276A; text-decoration: none;">
-    VLA-JEPA: Enhancing Vision-Language-Action Model with Latent World Model
-  </a>
-</h3>
+# G1 JEPA Learned Goal
 
-<div align="center">
-<p>
-  <a href="https://arxiv.org/abs/2602.10098">
-    <img src="https://img.shields.io/badge/Paper-PDF-orange.svg" alt="Paper PDF">
-  </a>
-  <a href="https://ginwind.github.io/VLA-JEPA/">
-    <img src="https://img.shields.io/badge/Project-Page-Green.svg" alt="Project Page">
-  </a>
-  <a href="https://huggingface.co/ginwind/VLA-JEPA">
-    <img src="https://img.shields.io/badge/🤗-Hugging_Face-yellow.svg" alt="Hugging Face">
-  </a>
-</p>
-</div>
+面向 Unitree G1 的单视角视觉语言动作框架。模型结合 V-JEPA 2.1 视觉表征、指令条件目标预测、动作条件世界模型和 GRU 动作先验，从当前 ego 图像、任务指令与机器人状态生成动作 chunk。
 
-<div align="center">
-  <img src="assets/VLA-JEPA.png" width="90%" alt="VLA-JEPA overview" />
-</div>
+支持两种控制接口：**SIMPLE 仿真：32 维 state / 36 维 action**；**SONIC 真机：46 维 state / 78 维 action**。
 
-> **Development fork.** This repository extends the original
-> [VLA-JEPA](https://github.com/ginwind/VLA-JEPA) with: (1) support for the
-> **SonicStar / Unitree G1 humanoid latent-action** dataset, and (2) a pluggable
-> **V-JEPA 2.1** world-model encoder. See [`pipeline.md`](./pipeline.md) for the
-> full change log and design notes.
+[方法](docs/learned_goals.md) · [控制接口](docs/control_interfaces.md) · [8×A100 训练](README_8XA100_中文.md) · [部署协议](deployment/model_server/README.md)
 
-## Table of Contents
-- [🆕 What's New in This Fork](#whats-new)
-- [⚙️ Environment Setup](#environment-setup)
-- [🔥 Training](#training)
-  - [0️⃣ Pretrained Model Preparation](#pretrained-model-preparation)
-  - [1️⃣ Data Preparation](#data-preparation)
-  - [2️⃣ Start Training](#start-training)
-  - [3️⃣ Custom Dataset Training](#custom-dataset-training)
-- [📊 Evaluation](#evaluation)
-- [🚀 Deployment](#deployment)
-- [🤝 Acknowledgement](#acknowledgement)
-- [📝 Citation](#citation)
+## 方法
 
-<a id="whats-new"></a>
-## 🆕 What's New in This Fork
+```mermaid
+flowchart TD
+    I[当前 ego 图像] --> E[V-JEPA 2.1 编码器]
+    I --> Q[Qwen3-VL]
+    L[任务指令] --> Q
+    E --> G[目标 latent 预测器]
+    Q --> G
+    S[当前机器人状态] --> G
+    G --> P[目标条件动作 proposal]
+    E --> P
+    S --> P
+    Q --> A[Action Expert]
+    S --> A
+    P --> C[候选动作集合]
+    A --> C
+    C --> W[动作条件世界模型]
+    E --> W
+    Q --> W
+    C --> R[GRU 动作先验]
+    S --> R
+    G --> V[目标进展与先验评分]
+    E --> V
+    W --> V
+    R --> V
+    V --> O[选出的动作 chunk]
+```
 
-- **SonicStar (Unitree G1) latent-action support.** A new data config
-  (`SonicLatentDataConfig`) and mixture for the humanoid dataset whose actions are
-  `motion_token(64) + left/right hand joints(7+7) = 78-dim`, with `46-dim` state.
-  See `scripts/config/vlajepa_sonic_latent.yaml`.
-- **Pluggable V-JEPA 2.1 encoder.** The world-model encoder can be either the
-  stock HuggingFace V-JEPA 2 model **or** Meta's V-JEPA 2.1 ViT-L/384. The choice
-  is driven purely by `framework.vj2_model.base_encoder`:
-  - a **HF model directory** (e.g. `vjepa2-vitl-fpc64-256`) → loaded via `AutoModel` (V-JEPA 2);
-  - a **`.pt` file** (e.g. `vjepa2_1_vitl_dist_vitG_384.pt`) → loaded via the vendored
-    2.1 encoder adapter in `starVLA/model/modules/world_model/`.
+1. **视觉目标预测**：将当前 JEPA 特征、Qwen 图像／指令条件特征和 state 输入 MLP，预测未来视觉目标 latent。训练监督来自示范的未来帧，部署时自动预测目标。
+2. **动作候选生成**：目标条件 proposal 生成一个动作 chunk，Action Expert 通过采样生成其余候选，默认共 8 个。
+3. **执行结果预测**：世界模型结合当前视觉特征、指令条件与候选动作，预测 chunk 末端的视觉特征。
+4. **候选评分**：计算候选带来的视觉目标进展，并扣除 GRU 下一步动作预测误差，选取最高分候选。
 
-  Both paths are interchangeable; `scripts/config/vlajepa_sonic_latent_vjepa21.yaml`
-  is the V-JEPA 2.1 variant (384px).
+JEPA 的视觉 latent 与 SONIC 的 motion token 分别承担目标表征和运动控制。默认视觉特征维度为 1024；SONIC 动作为 64 维 motion token 加 14 维双手控制。训练与推理的数据流、损失定义见 [方法说明](docs/learned_goals.md)。
 
-<a id="environment-setup"></a>
-## ⚙️ Environment Setup
+## 安装
 
 ```bash
-git clone https://github.com/Ju6276/VLA-JEPA-DEV.git
+git clone --branch feat/g1-jepa-learned-goal https://github.com/Ju6276/VLA-JEPA-DEV.git
 cd VLA-JEPA-DEV
 
-# Create conda environment
 conda create -n VLA_JEPA python=3.10 -y
 conda activate VLA_JEPA
-
-# Install requirements
 pip install -r requirements.txt
-
-# Install FlashAttention2
 pip install flash-attn --no-build-isolation
-
-# Install project
 pip install -e .
 ```
 
-This repository's code is based on [starVLA](https://github.com/starVLA/starVLA).
+训练使用 CUDA、BF16 和 DeepSpeed ZeRO-2。依赖版本由 [requirements.txt](requirements.txt) 定义。
 
-<a id="training"></a>
-## 🔥 Training
+## 预训练模型
 
-<a id="pretrained-model-preparation"></a>
-### 0️⃣ Pretrained Model Preparation
+| 模型 | 用途 | 来源 |
+|---|---|---|
+| Qwen3-VL-2B-Instruct | 图像与语言条件特征 | [Hugging Face](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct) |
+| V-JEPA 2.1 ViT-L 384px | 冻结的视觉编码器 | [Meta V-JEPA](https://github.com/facebookresearch/vjepa2) |
 
-Download the [Qwen3-VL-2B](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct) and a world-model encoder:
-
-- **V-JEPA 2** (default): [`facebook/vjepa2-vitl-fpc64-256`](https://huggingface.co/facebook/vjepa2-vitl-fpc64-256)
-- **V-JEPA 2.1** (optional, 384px): download the ViT-L checkpoint from Meta's CDN
-  ```bash
-  wget https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt
-  ```
-
-<a id="data-preparation"></a>
-### 1️⃣ Data Preparation
-
-Robot datasets use the **LeRobot v2.1** format. Add a `modality.json` file under each
-dataset's `meta/` subdirectory; templates for LIBERO, BridgeV2, Fractal, and Droid are
-provided under `./examples` (BridgeV2 and Fractal under `./examples/SimplerEnv`).
-
-<a id="start-training"></a>
-### 2️⃣ Start Training
-
-Pick a script + YAML from [`/scripts`](./scripts). In the YAML, make sure:
-
-- `framework.qwenvl.base_vlm` and `framework.vj2_model.base_encoder` point to your
-  downloaded checkpoints (a `.pt` encoder path automatically enables the V-JEPA 2.1 adapter);
-- `datasets.vla_data.data_root_dir` / `data_mix` match your dataset.
-
-Then launch, e.g. for the SonicStar (Unitree G1) runs:
+准备 `vjepa2_1_vitl_dist_vitG_384.pt`，设置模型与输出路径：
 
 ```bash
-# V-JEPA 2 (256px)
-bash scripts/vlajepa_sonic_latent.sh
-
-# V-JEPA 2.1 (384px)
-bash scripts/vlajepa_sonic_latent_vjepa21.sh
+export VJEPA21_CKPT=/path/to/vjepa2_1_vitl_dist_vitG_384.pt
+export QWEN_MODEL=Qwen/Qwen3-VL-2B-Instruct
+export OUTPUT_ROOT=/path/to/checkpoints
+export NUM_PROCESSES=8
+export WANDB_MODE=offline
 ```
 
-> The launch scripts use `accelerate` + DeepSpeed ZeRO-2 (8 GPUs by default) and
-> require `WANDB_API_KEY` to be exported when `WANDB_MODE=online`.
+`QWEN_MODEL` 支持 Hugging Face 模型 ID 或本地模型目录。V-JEPA 2.1 通过仓库中的 [编码器适配器](starVLA/model/modules/world_model/vjepa21_encoder.py) 加载 `.pt` 权重。
 
-<a id="custom-dataset-training"></a>
-### 3️⃣ Custom Dataset Training
+## 数据准备
 
-VLA-JEPA supports both robot datasets and human video datasets.
+数据使用 LeRobot 格式，包含 `data/`、`videos/`、`meta/info.json` 和 `meta/modality.json`。训练从同一条示范读取当前观测、动作 chunk 和未来目标图像。
 
-- **Robot Data (LeRobot v2.1):**
-  - Define a config class in [`data_config.py`](./starVLA/dataloader/gr00t_lerobot/data_config.py)
-    (its video/state/action keys must match `modality.json`), and register it in
-    `ROBOT_TYPE_CONFIG_MAP`. `SonicLatentDataConfig` is a worked example.
-  - Register the mixture in [`mixtures.py`](./starVLA/dataloader/gr00t_lerobot/mixtures.py):
-    the dict key maps to `datasets.vla_data.data_mix`, and each entry is
-    `(subdirectory, version, robot_type)`. `robot_type` selects state/action
-    normalization. Add the matching `EmbodimentTag` in
-    [`embodiment_tags.py`](./starVLA/dataloader/gr00t_lerobot/embodiment_tags.py).
+### SIMPLE
 
-- **Human Video:** implement your own DataLoader and register it in `build_dataloader`
-  (`./starVLA/dataloader/__init__.py`), or use the provided video dataloader and configure
-  `datasets.video_data` (`video_dir`, `text_file`, `CoT_prompt`, `extensions`).
-
-<a id="evaluation"></a>
-## 📊 Evaluation
-
-Pretrained reference checkpoints: https://huggingface.co/ginwind/VLA-JEPA
+下载 [SIMPLE Pick Between Tables 数据](https://huggingface.co/datasets/USC-PSI-Lab/psi-data/tree/main/simple)：
 
 ```bash
-# Extra eval deps (inside the VLA_JEPA env)
-pip install tyro matplotlib mediapy websockets msgpack
+export DATA_ROOT=/path/to/sim_data_root
+hf download USC-PSI-Lab/psi-data \
+  simple/G1WholebodyLocomotionPickBetweenTablesTeleop-v0.zip \
+  --repo-type dataset --local-dir /path/to/downloads
+
+mkdir -p "${DATA_ROOT}/dataset"
+unzip /path/to/downloads/simple/G1WholebodyLocomotionPickBetweenTablesTeleop-v0.zip \
+  -d "${DATA_ROOT}/dataset"
 ```
 
-**Common configuration (all benchmarks):** in the checkpoint folder, edit `config.json`
-and `config.yaml` so `framework.qwenvl.base_vlm` and `framework.vj2_model.base_encoder`
-point to your local checkpoints. Each benchmark runs in its own conda environment and
-talks to the model over a WebSocket policy server (see [Deployment](#deployment)).
+目录结构：
 
-| Benchmark | Setup | Launch |
-| --- | --- | --- |
-| **LIBERO** | [official repo](https://github.com/Lifelong-Robot-Learning/LIBERO); set `LIBERO_HOME`, `sim_python`, `your_ckpt` in the script | `bash ./examples/LIBERO/eval_libero.sh` (4 suites / 4 GPUs) |
-| **LIBERO-Plus** | [repo](https://github.com/sylvestf/LIBERO-plus); follow `./examples/LIBERO-Plus/libero_plus_init.py` notes | `bash ./examples/LIBERO-Plus/eval_libero_plus.sh` (7 dims / 7 GPUs) |
-| **SimplerEnv** | [repo](https://github.com/simpler-env/SimplerEnv); set `SimplerEnv_PATH`, `sim_python`, `MODEL_PATH` | `bash examples/SimplerEnv/eval_files/auto_eval_scripts/batch_evaluate.sh` |
-
-For SimplerEnv, compute success rates afterwards:
-
-```bash
-# <task_suite>: pick_coke_can | move_near | drawer | long_horizon_apple_in_drawer | bridge_put_on
-bash ./examples/SimplerEnv/eval_files/auto_eval_scripts/calc_success_rate.sh <task_suite> <model_path> <log_dir>
+```text
+sim_data_root/
+└── dataset/G1WholebodyLocomotionPickBetweenTablesTeleop-v0/
+    ├── data/
+    ├── videos/
+    └── meta/
 ```
 
-> Ensure every parallel process has a GPU and that all checkpoint paths are correct.
-> Reduce the parallelization in the launch scripts if you have fewer GPUs.
+### SONIC
 
-<a id="deployment"></a>
-## 🚀 Deployment
+使用 [SONIC latent 数据](https://huggingface.co/datasets/Tang-keke/merged_dataset_001) 或按相同字段组织的采集数据：
 
-The model is served as a **WebSocket policy server**; simulators / robots connect as
-clients (msgpack-numpy protocol).
+```text
+sonic_data_root/
+└── merged_dataset_001/
+    ├── data/
+    ├── videos/
+    └── meta/
+```
+
+视频键、关节顺序、motion token 与归一化方式见 [控制接口](docs/control_interfaces.md)。自定义数据集通过 [mixtures.py](starVLA/dataloader/gr00t_lerobot/mixtures.py) 注册，并在 [data_config.py](starVLA/dataloader/gr00t_lerobot/data_config.py) 中定义字段和变换。
+
+## 训练
+
+| 配置 | SIMPLE | SONIC |
+|---|---|---|
+| state / action | 32 / 36 | 46 / 78 |
+| chunk 长度 | 30 | 40 |
+| 目标时刻 | t+30 | t+40 |
+| 每卡默认 batch | 32 | 4 |
+| 默认 run_id | `g1_pick_between_tables_delta_jepa_8xa100` | `sonic_latent_learned_goal` |
+| 配置文件 | [SIMPLE YAML](scripts/config/vlajepa_g1_pick_between_tables_vjepa21_8xa100.yaml) | [SONIC YAML](scripts/config/vlajepa_sonic_latent_learned_goal.yaml) |
+
+SIMPLE：
 
 ```bash
-# Start the server (loads config + weights from the checkpoint dir)
+DATA_ROOT=/path/to/sim_data_root bash scripts/train_g1_delta_jepa_8xa100.sh
+```
+
+SONIC：
+
+```bash
+DATA_ROOT=/path/to/sonic_data_root bash scripts/train_sonic_learned_goal.sh
+```
+
+调整 GPU 数量、batch 或训练步数：
+
+```bash
+NUM_PROCESSES=4 PER_DEVICE_BATCH_SIZE=2 \
+DATA_ROOT=/path/to/sonic_data_root \
+  bash scripts/train_sonic_learned_goal.sh \
+    --trainer.max_train_steps 40000 \
+    --trainer.save_interval 5000
+```
+
+每个 run 独立保存配置、数据归一化统计、训练日志和 checkpoint。SIMPLE 与 SONIC 分别训练各自的状态输入层和控制模块。完整训练步骤见 [8×A100 指南](README_8XA100_中文.md)。
+
+## 部署
+
+加载训练得到的 checkpoint，启动 WebSocket 服务：
+
+```bash
 python -m deployment.model_server.server_policy \
-  --ckpt_path /path/to/run/checkpoints/steps_XXXXX_pytorch_model.pt \
-  --port 10093 --cuda 0
-
-# Smoke-test the connection from another shell
-python deployment/model_server/debug_server_policy.py --host 127.0.0.1 --port 10093 --test infer
+  --ckpt_path /path/to/checkpoints/sonic_latent_learned_goal/checkpoints/steps_40000_pytorch_model.pt \
+  --cuda 0 --use_bf16 --port 10093
 ```
 
-`server_policy.py` rebuilds the model from the run's `config.yaml`, so the encoder
-referenced by `base_encoder` (HF dir or `.pt`) must be present at deploy time.
+客户端发送当前 ego RGB、任务指令和归一化后的 state。服务返回动作 chunk，客户端按对应统计量反归一化，再交给 SIMPLE 或 SONIC 控制接口执行。
 
-<a id="acknowledgement"></a>
-## 🤝 Acknowledgement
+默认 `learned_goal_enabled: true`、`use_verifier: true`、`subgoals_path: null`。目标预测器在每次请求中计算目标，返回的 `goal_source` 为 `predicted`。服务同时加载 V-JEPA 编码器与世界模型；checkpoint 配置中的基础模型路径应在部署机器上可访问。
 
-We extend our sincere gratitude to the [starVLA](https://github.com/starVLA/starVLA)
-and [V-JEPA2](https://github.com/facebookresearch/vjepa2) projects for their invaluable
-open-source contributions.
+客户端示例、请求与响应字段见 [部署文档](deployment/model_server/README.md)。
 
-<a id="citation"></a>
-## 📝 Citation
+## 配置与实验
 
-If you find our code or models useful, please cite [the paper](https://arxiv.org/abs/2602.10098):
+| 参数 | 默认值 | 含义 |
+|---|---|---|
+| `learned_goal_enabled` | `true` | 自动预测视觉目标 |
+| `goal_proposal_predicted_weight` | `0.5` | proposal 训练中预测目标条件的占比 |
+| `goal_action_proposal_enabled` | `true` | 使用目标条件动作候选 |
+| `verifier_num_candidates` | `8` | 候选动作数量 |
+| `verifier_action_prior_weight` | `0.1` | GRU 预测误差的评分权重 |
+| `use_verifier` | `true` | 执行动作候选评分 |
 
-```bibtex
-@misc{vlajepa2026,
-      title={VLA-JEPA: Enhancing Vision-Language-Action Model with Latent World Model},
-      author={Jingwen Sun and Wenyao Zhang and Zekun Qi and Shaojie Ren and Zezhi Liu and Hanxin Zhu and Guangzhong Sun and Xin Jin and Zhibo Chen},
-      year={2026},
-      eprint={2602.10098},
-      archivePrefix={arXiv},
-      primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2602.10098},
-}
+这些参数位于 YAML 的 `framework.delta_jepa` 节点。运行时控制、实验对照及 checkpoint 初始化见 [方法说明](docs/learned_goals.md#实验配置)。
+
+## 测试
+
+```bash
+pip install pytest
+OMP_NUM_THREADS=1 NO_ALBUMENTATIONS_UPDATE=1 \
+  python -m pytest tests/test_learned_goal.py -q
 ```
+
+测试使用轻量骨干，覆盖训练梯度、未来信息隔离、自动目标推理、显式目标覆盖、BF16 输出、权重恢复，以及 SIMPLE / SONIC 的接口与时间对齐。
+
+## 代码结构
+
+```text
+starVLA/model/framework/VLA_JEPA.py              训练与候选验证流程
+starVLA/model/modules/world_model/delta_jepa.py   目标预测、动作 proposal、GRU prior
+starVLA/model/modules/world_model/vjepa21_encoder.py
+                                                V-JEPA 2.1 编码器适配
+starVLA/dataloader/                              数据读取、字段映射与归一化
+scripts/config/                                 模型与训练配置
+scripts/train_learned_goal.sh                    通用训练启动器
+deployment/model_server/                        WebSocket 推理服务与客户端
+tests/test_learned_goal.py                      集成测试
+```
+
+## 致谢
+
+本项目基于 [VLA-JEPA](https://github.com/ginwind/VLA-JEPA) 和 [starVLA](https://github.com/starVLA/starVLA)，使用 [Qwen3-VL](https://github.com/QwenLM/Qwen3-VL) 与 [V-JEPA](https://github.com/facebookresearch/vjepa2) 模型，并对接 [SIMPLE](https://github.com/physical-superintelligence-lab/SIMPLE) 与 SONIC 控制接口。

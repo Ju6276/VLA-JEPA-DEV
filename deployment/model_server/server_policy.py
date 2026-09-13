@@ -35,9 +35,15 @@ def main(args) -> None:
         vla.use_verifier_default = True
         logging.info("Enabled latent action verifier by default")
 
+    if getattr(vla, "goal_predictor", None) is not None and not subgoals_path:
+        logging.info("Using learned JEPA goals from the current observation, instruction and state")
+
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
     logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
+
+    model_framework = getattr(getattr(vla, "config", None), "framework", None)
+    action_cfg = getattr(model_framework, "action_model", None)
 
     server = WebsocketPolicyServer(
         policy=vla,
@@ -46,6 +52,10 @@ def main(args) -> None:
         metadata={
             "env": "g1_humanoid",
             "use_verifier": bool(getattr(vla, "use_verifier_default", False)),
+            "learned_goal_enabled": bool(getattr(vla, "use_learned_goal", False)),
+            "state_dim": getattr(action_cfg, "state_dim", None),
+            "action_dim": getattr(action_cfg, "action_dim", None),
+            "action_horizon": getattr(action_cfg, "action_horizon", None),
             "num_subgoals": getattr(getattr(vla, "subgoal_tracker", None), "num_subgoals", 0),
         },
     )

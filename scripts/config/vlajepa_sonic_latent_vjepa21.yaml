@@ -1,37 +1,17 @@
-# =============================================================================
-# SonicStar (Unitree G1) latent-action training — V-JEPA 2.1 ViT-L/16 (300M, 384)
-# -----------------------------------------------------------------------------
-# This config switches the world-model visual encoder to V-JEPA 2.1 ViT-L/384.
-#
-# PREREQUISITES before this config can run (see pipeline.md changelog):
-#   1) Weights: download the V-JEPA 2.1 ViT-L/384 checkpoint and place it at the
-#      `base_encoder` path below. As of now Meta ships 2.1 via PyTorch Hub
-#      (`torch.hub.load('facebookresearch/vjepa2', 'vjepa2_1_vit_large_384')`);
-#      HF Hub upload is still pending (facebookresearch/vjepa2#137).
-#   2) Loader support: the installed `transformers` (5.8.1) does NOT yet support
-#      the 2.1 architecture (corrected RoPE / modality embeddings / deep
-#      supervision norms / proj_context). Either upgrade transformers to a build
-#      that includes huggingface/transformers#45497, or adapt VLA_JEPA.py to load
-#      the encoder via Meta's torch.hub path.
-#   3) Resolution: 2.1 ViT-L final checkpoint is 384px (cool-down phase), hence
-#      `video_resolution_size: 384` below (was 256 for fpc16/fpc64 256px models).
-# Backbone dims are unchanged vs ViT-L/256 (hidden_size=1024, tubelet_size=2,
-# patch_size=16), so the action model / predictor dims need no change.
-# =============================================================================
-# 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
+# SONIC latent-action training with the V-JEPA 2.1 ViT-L 384px encoder.
 run_id: sonic_latent_vjepa21
 run_root_dir: checkpoints
 seed: 42
 trackers:
 - json
 - wandb
-wandb_entity: ju-dong6276-technical-university-of-munich
-wandb_project: vlajepa_sonic_latent_vjepa21
+wandb_entity: null
+wandb_project: VLA_JEPA_SONIC
 is_debug: false
 framework:
   name: VLA_JEPA
   qwenvl:
-    base_vlm: /dev/shm/models/Qwen3-VL-2B-Instruct
+    base_vlm: Qwen/Qwen3-VL-2B-Instruct
     attn_implementation: flash_attention_2
     vl_hidden_dim: 2048
   action_model:
@@ -65,7 +45,7 @@ framework:
     # V-JEPA 2.1 ViT-L/16 (300M), 384px. Meta raw `.pt` checkpoint; a `.pt` path
     # triggers the vendored 2.1 encoder adapter in VLA_JEPA.py (transformers can't
     # load 2.1). checkpoint key used internally = "ema_encoder".
-    base_encoder: /dev/shm/models/vjepa2_1_vitl_dist_vitG_384.pt
+    base_encoder: /path/to/vjepa2_1_vitl_dist_vitG_384.pt
     arch: vit_large
     image_size: 384
     num_video_views: 1

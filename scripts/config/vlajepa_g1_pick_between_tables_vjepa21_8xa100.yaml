@@ -59,7 +59,8 @@ framework:
     num_frames: 8
 
   # 当前实验改动默认全部开启。
-  # 训练输出 action/wm/delta/ctrl/action_prior/goal_proposal 六个 loss。
+  # 单 ego 视角；目标由当前观察、指令和状态预测，无需 subgoal 文件。
+  # 训练输出 action/wm/delta/ctrl/action_prior/goal_proposal/goal_prediction 七个 loss。
   delta_jepa:
     enabled: true
     blend_vlm_tokens: true
@@ -71,14 +72,16 @@ framework:
     verifier_action_prior_weight: 0.1
     goal_action_proposal_enabled: true
     lambda_goal_proposal: 0.01
+    learned_goal_enabled: true
+    lambda_goal_prediction: 0.05
+    goal_proposal_predicted_weight: 0.5
     ctrl_action_step: first
     hidden_dim: 512
     verifier_num_candidates: 8
     use_verifier: true
     subgoal_tracking_mode: sequential
     subgoal_epsilon: 0.15
-    # 启动脚本会用 SUBGOALS_PATH 覆盖。
-    subgoals_path: /path/to/subgoals
+    subgoals_path: null
 
   reduce_in_full_precision: true
 
@@ -94,6 +97,8 @@ datasets:
     resolution_size: 224
     image_size: [224, 224]
     video_resolution_size: 384
+    # 8 个采样帧覆盖 30 步动作，末帧为自动目标的训练标签。
+    video_frame_offsets: [0, 4, 8, 12, 16, 20, 24, 30]
     per_device_batch_size: 32
     load_all_data_for_training: true
     with_state: true
