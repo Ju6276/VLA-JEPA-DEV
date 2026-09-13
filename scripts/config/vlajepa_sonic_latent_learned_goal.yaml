@@ -1,7 +1,7 @@
 # SONIC real-robot interface: state 46, action 64D motion_token + 14 hand-joint channels.
 # Independent model/checkpoint from the non-SONIC simulation (state 32, action 36).
 # Uses the existing SonicLatentDataConfig; DATA_ROOT must contain merged_dataset_001/.
-run_id: sonic_latent_learned_goal
+run_id: sonic_learned_goal_core
 run_root_dir: checkpoints
 seed: 42
 trackers:
@@ -55,11 +55,12 @@ framework:
     num_embodied_action_tokens_per_instruction: 32
     num_frames: 8
   delta_jepa:
+    # Five active losses; enable delta/ctrl with train_learned_goal_ablation.sh.
     enabled: true
     blend_vlm_tokens: true
     lambda_wm: 0.1
-    lambda_delta: 0.05
-    lambda_ctrl: 0.02
+    lambda_delta: 0.0
+    lambda_ctrl: 0.0
     lambda_action_prior: 0.01
     action_prior_num_layers: 2
     verifier_action_prior_weight: 0.1

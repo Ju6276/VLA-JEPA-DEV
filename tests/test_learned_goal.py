@@ -387,6 +387,38 @@ def test_training_backward_and_current_only_world_model(make_model, examples):
     torch.testing.assert_close(training_input, model.vj_predictor.inputs[-1])
 
 
+@pytest.mark.parametrize("config_name", [
+    "vlajepa_g1_pick_between_tables_vjepa21_8xa100.yaml",
+    "vlajepa_sonic_latent_learned_goal.yaml",
+])
+def test_core_loss_defaults_keep_goal_proposal_world_model_and_prior_trainable(
+    make_model, examples, config_name,
+):
+    torch.manual_seed(2)
+    cfg = OmegaConf.load(ROOT / "scripts/config" / config_name).framework.delta_jepa
+    model = make_model()
+    model.lambda_delta = cfg.lambda_delta
+    model.lambda_ctrl = cfg.lambda_ctrl
+    assert cfg.learned_goal_enabled and cfg.goal_action_proposal_enabled and cfg.use_verifier
+    assert model.lambda_delta == model.lambda_ctrl == 0
+    losses = model(examples)
+    assert {name for name, value in losses.items() if value.item() != 0} == {
+        "action_loss", "wm_loss", "action_prior_loss", "goal_proposal_loss", "goal_prediction_loss",
+    }
+    sum(losses.values()).backward()
+    for module in (
+        model.action_model, model.vj_predictor, model.candidate_action_encoder,
+        model.action_dynamics_prior, model.goal_predictor, model.goal_action_proposal,
+    ):
+        assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters())
+    assert all(p.grad is None or not p.grad.count_nonzero() for p in model.inv_dyn_decoder.parameters())
+    assert all(p.grad is None for p in model.vj_encoder.parameters())
+    result = model.eval().predict_action(**inference_inputs(examples), num_candidates=3)
+    assert result["goal_source"] == "predicted"
+    assert result["goal_proposal_used"]
+    assert result["candidate_scores"].shape == (len(examples), 3)
+
+
 @pytest.mark.parametrize("learned", [True, False])
 def test_all_goal_heads_share_the_deployed_current_latent(make_model, examples, learned):
     model = make_model(learned=learned).eval()
@@ -473,6 +505,54 @@ def test_deployment_without_external_goal(make_model, examples, num_candidates):
     assert result["all_candidates"].shape == (2, num_candidates, 4, 3)
     assert np.isfinite(result["verification_scores"]).all()
     assert len(calls) == 1  # All candidates must be scored against the same goal.
+
+
+@pytest.mark.parametrize("num_candidates", [1, 3])
+@pytest.mark.parametrize("proposal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_candidate_score_components_explain_selected_action_without_extra_model_calls(
+    make_model, examples, num_candidates, proposal, dtype,
+):
+    torch.manual_seed(7)
+    model = make_model(proposal=proposal).eval().to(dtype)
+    calls = {"encoder": 0, "prior": 0}
+
+    def count_call(name):
+        def hook(*args):
+            calls[name] += 1
+        return hook
+
+    hooks = [
+        model.vj_encoder.proj.register_forward_hook(count_call("encoder")),
+        model.action_dynamics_prior.input_proj.register_forward_hook(count_call("prior")),
+    ]
+    try:
+        result = model.predict_action(**inference_inputs(examples), num_candidates=num_candidates)
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+    for key in ("candidate_goal_progress", "candidate_prior_error", "candidate_scores"):
+        assert result[key].shape == (len(examples), num_candidates)
+        assert result[key].dtype == np.float32
+        assert np.isfinite(result[key]).all()
+    # The exported float32 arrays preserve scores computed in the model's
+    # original dtype, including BF16 rounding before selection.
+    progress = torch.from_numpy(result["candidate_goal_progress"]).to(dtype)
+    prior = torch.from_numpy(result["candidate_prior_error"]).to(dtype)
+    recombined = (progress - model.verifier_action_prior_weight * prior).float().numpy()
+    np.testing.assert_array_equal(result["candidate_scores"], recombined)
+
+    best_indices = result["candidate_scores"].argmax(axis=1)
+    batch_indices = np.arange(len(examples))
+    np.testing.assert_array_equal(
+        result["verification_scores"], result["candidate_scores"][batch_indices, best_indices],
+    )
+    np.testing.assert_array_equal(
+        result["normalized_actions"], result["all_candidates"][batch_indices, best_indices],
+    )
+    assert calls == {"encoder": 1, "prior": num_candidates}
+    assert len(model.vj_predictor.inputs) == num_candidates
 
 
 def test_bfloat16_single_proposal_export(make_model, examples):

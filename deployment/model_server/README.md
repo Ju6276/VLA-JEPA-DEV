@@ -6,7 +6,7 @@
 
 ```bash
 python -m deployment.model_server.server_policy \
-  --ckpt_path /path/to/checkpoints/sonic_latent_learned_goal/checkpoints/steps_40000_pytorch_model.pt \
+  --ckpt_path /path/to/checkpoints/sonic_learned_goal_core_8xa100/checkpoints/steps_40000_pytorch_model.pt \
   --cuda 0 --use_bf16 --port 10093
 ```
 
@@ -84,9 +84,14 @@ SIMPLE 输出为 `[30,36]`，SONIC 输出为 `[40,78]`。原始 state 可通过 
 | `normalized_actions` | `[B,H,A]` float32 | 选中的动作 chunk |
 | `verification_scores` | `[B]` float32 | 选中候选的分数 |
 | `all_candidates` | `[B,N,H,A]` float32 | 全部候选动作 |
+| `candidate_goal_progress` | `[B,N]` float32 | 每个候选的视觉目标进展 |
+| `candidate_prior_error` | `[B,N]` float32 | 每个候选的动作 prior 误差 |
+| `candidate_scores` | `[B,N]` float32 | 每个候选的联合分数，与候选顺序一致 |
 | `goal_source` | string | `predicted`、`images` 或 `tracker` |
 | `goal_proposal_used` | bool | 是否包含目标条件 proposal |
 | `subgoal_index` | integer / null | 外部 tracker 的目标位置 |
+
+候选分项复用已有计算，组合公式为 `candidate_scores = candidate_goal_progress - beta * candidate_prior_error`，其中 `beta` 为 checkpoint 配置的 `verifier_action_prior_weight`。分数以模型计算时的精度求得，再转成 float32 导出；复现服务端选择时直接使用 `candidate_scores`，保留混合精度的舍入结果。固定候选集合的评分对照见 [消融实验](../../docs/ablations.md)。
 
 ## 推理控制
 

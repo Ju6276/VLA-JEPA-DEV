@@ -57,13 +57,17 @@ Qwen 条件 tokens 由当前图像与指令计算。目标预测器输出的是�
 |---|---|---:|
 | `action_loss` | Action Expert 的动作学习目标 | 1.0 |
 | `wm_loss` | 预测终点与目标 patch tokens 的 L1 距离 | 0.1 |
-| `delta_loss` | 预测位移与目标位移的 MSE | 0.05 |
-| `ctrl_loss` | 从真实／预测位移恢复动作的 MSE 之和 | 0.02 |
+| `delta_loss` | 归一化全局未来 latent 的对齐 MSE，辅助项 | 0.0 |
+| `ctrl_loss` | 从真实／预测位移恢复单步动作的 MSE 之和，辅助项 | 0.0 |
 | `action_prior_loss` | GRU 下一步动作预测 MSE | 0.01 |
 | `goal_proposal_loss` | 目标条件动作 chunk 重建 MSE | 0.01 |
 | `goal_prediction_loss` | 预测目标与真实目标的 cosine 距离 | 0.05 |
 
-框架返回的损失值已乘以上述权重。V-JEPA 编码器显式冻结、保持 eval 模式并排除在优化器之外；目标预测器、动作模块、世界模型与 Qwen 按训练配置优化。
+主训练配置有五项非零加权损失，保留相同的模型结构和七个日志字段；关闭的辅助项返回加权后的零值。`delta`、`ctrl`、`full` 消融预设分别启用全局对齐、逆动力学或两者，见 [消融实验](ablations.md)。
+
+`delta_loss` 比较 `(z_predicted - z_current)` 与 `(z_target - z_current)`；共同的当前 latent 在数学上抵消，因此这项约束是池化、归一化后的未来特征对齐。`wm_loss` 监督逐 patch 特征的 L1 距离，两项使用不同的特征粒度与距离。
+
+框架返回的损失值已乘以上述权重。V-JEPA 编码器显式冻结、保持 eval 模式并排除在优化器之外；目标预测器、动作模块、世界模型与 Qwen 按训练配置优化。逆动力学辅助损失更新解码器及预测分支，目标预测头由 cosine 目标监督；proposal 中的预测目标使用 stop-gradient。
 
 动作学习的噪声重复次数由 `trainer.repeated_diffusion_steps` 控制，默认4。训练期间的 MAE/MSE 是当前训练 batch 的动作误差诊断：暂时关闭 dropout、跨进程聚合后恢复训练模式。MSE 按逐元素平方误差的均值计算。
 
@@ -89,6 +93,8 @@ score(A) = d(z_t, g_t) - d(z_future(A), g_t) - beta * E_prior(A, s_t)
 
 默认 beta=0.1。最高分候选作为输出，服务返回 `normalized_actions`、`all_candidates` 和选中候选的 `verification_scores`。
 
+`candidate_goal_progress`、`candidate_prior_error` 和 `candidate_scores` 保存全部候选的对应分项，形状均为 `[B,N]`。它们来自同一次候选生成与未来预测，支持固定候选集合的评分消融。
+
 目标来源按以下顺序选择：
 
 1. 请求中的 `subgoal_images`。
@@ -99,17 +105,9 @@ score(A) = d(z_t, g_t) - d(z_future(A), g_t) - beta * E_prior(A, s_t)
 
 ## 实验配置
 
-| 实验 | 配置方式 |
-|---|---|
-| 普通 Action Expert 推理 | 请求设置 `use_verifier=False` |
-| 自动目标与人工目标对比 | 同一模型分别使用默认目标或传入 `subgoal_images` |
-| GRU prior 评分对比 | 对同一候选集合比较 beta=0 与 beta=0.1 |
-| 目标条件 proposal 对比 | 分别训练 `goal_action_proposal_enabled: false / true` 的模型 |
-| 候选数量对比 | 请求设置 `num_candidates` |
+辅助损失的四组训练、评分机制的四组推理、目标来源与 proposal 对照见 [消融实验](ablations.md)。各组固定数据、控制接口、训练预算与评估任务，分别记录任务成功率、动作变化量、手部控制误差和推理延迟。
 
-对比 prior 时固定输入、候选集合与随机种子；分别记录任务成功率、动作变化量、手部控制误差和推理延迟。自动目标与外部目标可在同一 checkpoint 上比较。
-
-关闭 `learned_goal_enabled` 会选择原有序列 teacher-forcing 世界模型监督；比较该配置时需要同时考虑世界模型训练输入和目标定义的变化。
+普通 Action Expert 可通过请求 `use_verifier=False` 运行；该路径改变候选生成流程。仅评价评分机制时，应使用同一次候选集合上的分项分数。关闭 `learned_goal_enabled` 会切换世界模型的训练输入与监督方式；自动目标和示范目标的单因素对照通过同一 checkpoint 的目标来源切换完成。
 
 ## checkpoint 初始化
 
@@ -146,4 +144,6 @@ bash scripts/train_sonic_learned_goal.sh \
 
 保存点 `steps_N/` 包含 Accelerate/DeepSpeed 模型与优化器状态、学习率调度器、各进程随机状态、训练步数和 epoch／batch 位置；同级 `steps_N_pytorch_model.pt` 用于部署。`trainer_state.json` 在所有状态保存完成后写入。
 
-恢复时保持相同的数据、每进程 batch、进程数与梯度累积设置。数据集 epoch 会传递到持续运行的 worker，恢复后从对应 batch 位置继续。worker 内的数据增强和预取随机状态不序列化，因此随机预处理不保证逐位重放。旧的单独 `.pt` 文件继续用于权重初始化和部署。
+恢复时保持相同的数据、每进程 batch、进程数、梯度累积和损失权重。上述普通入口默认使用五项损失；继续七项损失训练时，选择 `train_learned_goal_ablation.sh sonic full` 并沿用原 `RUN_ID`、`SEED` 与其他训练参数，或显式传入保存配置中的辅助权重。完整命令见 [辅助损失消融](ablations.md#辅助损失四组训练)。
+
+数据集 epoch 会传递到持续运行的 worker，恢复后从对应 batch 位置继续。worker 内的数据增强和预取随机状态不序列化，因此随机预处理不保证逐位重放。旧的单独 `.pt` 文件继续用于权重初始化和部署。

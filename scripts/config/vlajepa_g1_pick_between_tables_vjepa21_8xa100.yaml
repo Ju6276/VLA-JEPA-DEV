@@ -1,4 +1,4 @@
-run_id: g1_pick_between_tables_delta_jepa_8xa100
+run_id: simple_learned_goal_core_8xa100
 run_root_dir: checkpoints
 seed: 42
 trackers:
@@ -57,15 +57,14 @@ framework:
     num_embodied_action_tokens_per_instruction: 32
     num_frames: 8
 
-  # 当前实验改动默认全部开启。
   # 单 ego 视角；目标由当前观察、指令和状态预测，无需 subgoal 文件。
-  # 训练输出 action/wm/delta/ctrl/action_prior/goal_proposal/goal_prediction 七个 loss。
+  # 主配置使用五项有效损失；delta/ctrl 通过消融启动脚本单独或共同启用。
   delta_jepa:
     enabled: true
     blend_vlm_tokens: true
     lambda_wm: 0.1
-    lambda_delta: 0.05
-    lambda_ctrl: 0.02
+    lambda_delta: 0.0
+    lambda_ctrl: 0.0
     lambda_action_prior: 0.01
     action_prior_num_layers: 2
     verifier_action_prior_weight: 0.1

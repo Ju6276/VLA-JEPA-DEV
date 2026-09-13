@@ -951,6 +951,9 @@ class VLA_JEPA(baseframework):
 
         best_scores = torch.full((candidates.shape[0],), -1e9, device=candidates.device)
         best_actions = candidates[:, 0]
+        candidate_goal_progress = []
+        candidate_prior_error = []
+        candidate_scores = []
 
         for idx in range(candidates.shape[1]):
             candidate_chunk = candidates[:, idx]
@@ -969,6 +972,9 @@ class VLA_JEPA(baseframework):
                 goal_progress
                 - self.verifier_action_prior_weight * action_prior_error
             )
+            candidate_goal_progress.append(goal_progress)
+            candidate_prior_error.append(action_prior_error)
+            candidate_scores.append(scores)
             better = scores > best_scores
             best_scores = torch.where(better, scores, best_scores)
             best_actions = torch.where(better.unsqueeze(-1).unsqueeze(-1), candidate_chunk, best_actions)
@@ -977,6 +983,9 @@ class VLA_JEPA(baseframework):
             "normalized_actions": best_actions.float().cpu().numpy(),
             "verification_scores": best_scores.float().cpu().numpy(),
             "all_candidates": candidates.float().cpu().numpy(),
+            "candidate_goal_progress": torch.stack(candidate_goal_progress, dim=1).float().cpu().numpy(),
+            "candidate_prior_error": torch.stack(candidate_prior_error, dim=1).float().cpu().numpy(),
+            "candidate_scores": torch.stack(candidate_scores, dim=1).float().cpu().numpy(),
             "goal_proposal_used": self.goal_action_proposal is not None,
             "goal_source": goal_source,
             "subgoal_index": (

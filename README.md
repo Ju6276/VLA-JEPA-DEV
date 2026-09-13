@@ -39,7 +39,7 @@ flowchart TD
 
 目标、动作监督和世界模型预测使用相同时间跨度。当前帧与未来目标帧独立编码，目标条件动作训练同时使用真实目标与预测目标。默认视觉特征为 1024 维；state、action 维度与 chunk 长度由控制接口配置决定。
 
-训练包含动作学习、未来特征预测、位移预测、逆动力学、动作先验、目标条件动作重建和目标预测七项损失。其中逆动力学辅助头从视觉 latent 差值与 state 重建单步动作；部署时由目标条件 proposal 和 Action Expert 生成完整 chunk。网络结构与损失配置见 [方法说明](docs/learned_goals.md)。
+主训练配置使用动作学习、未来特征预测、动作先验、目标条件动作重建和目标预测五项有效损失。全局 latent 对齐与单步逆动力学作为辅助损失，提供独立消融预设。网络结构与损失配置见 [方法说明](docs/learned_goals.md)。
 
 ## 环境与安装
 
@@ -156,7 +156,7 @@ export FFMPEG_THREADS=1
 
 ```bash
 DATA_ROOT="${SIMPLE_DATA_ROOT}" \
-RUN_ID=simple_learned_goal_8xa100 \
+RUN_ID=simple_learned_goal_core_8xa100 \
 PER_DEVICE_BATCH_SIZE=1 \
   bash scripts/train_g1_delta_jepa_8xa100.sh \
     --trainer.gradient_accumulation_steps 32 \
@@ -168,7 +168,7 @@ PER_DEVICE_BATCH_SIZE=1 \
 
 ```bash
 DATA_ROOT="${SONIC_DATA_ROOT}" \
-RUN_ID=sonic_learned_goal_8xa100 \
+RUN_ID=sonic_learned_goal_core_8xa100 \
 PER_DEVICE_BATCH_SIZE=1 \
   bash scripts/train_sonic_learned_goal.sh \
     --trainer.gradient_accumulation_steps 4 \
@@ -179,6 +179,16 @@ PER_DEVICE_BATCH_SIZE=1 \
 两个命令分别占用整机 8 张卡，按所需控制接口选择运行。训练步数按优化器更新计数；默认 warmup 为 2,000 次更新，日志间隔为 10 次更新，动作预测诊断间隔为 500 次更新。默认 seed 为 42，Qwen 与动作模块的学习率分别为 `1e-5`、`1e-4`，V-JEPA 编码器保持冻结。
 
 GPU 数通过 `NUM_PROCESSES` 设置；脚本末尾的 `--trainer.*`、`--datasets.*` 参数覆盖训练配置。采样默认保留示范尾段并补齐；可通过 `--datasets.vla_data.require_full_horizon true` 仅采样动作和未来目标都完整的片段。更多配置见 [训练说明](docs/learned_goals.md)。
+
+辅助损失消融使用 `core`、`delta`、`ctrl`、`full` 四个预设；`full` 使用七项损失，其中辅助项权重为 `0.05` 和 `0.02`。例如，在同一份 SIMPLE 数据上启用两项辅助损失：
+
+```bash
+DATA_ROOT="${SIMPLE_DATA_ROOT}" PER_DEVICE_BATCH_SIZE=1 SEED=42 \
+  bash scripts/train_learned_goal_ablation.sh simple full \
+    --trainer.gradient_accumulation_steps 32
+```
+
+完整训练矩阵、候选评分对照与实验控制见 [消融实验](docs/ablations.md)。
 
 ## 输出与续训
 
@@ -210,23 +220,23 @@ tensorboard --logdir "${OUTPUT_ROOT}" --port 6006
 
 ```bash
 DATA_ROOT="${SONIC_DATA_ROOT}" \
-RUN_ID=sonic_learned_goal_8xa100 \
+RUN_ID=sonic_learned_goal_core_8xa100 \
 PER_DEVICE_BATCH_SIZE=1 \
   bash scripts/train_sonic_learned_goal.sh \
     --trainer.gradient_accumulation_steps 4 \
     --trainer.max_train_steps 40000 \
     --trainer.save_interval 10000 \
     --trainer.resume_from_checkpoint \
-    "${OUTPUT_ROOT}/sonic_learned_goal_8xa100/checkpoints/steps_10000"
+    "${OUTPUT_ROOT}/sonic_learned_goal_core_8xa100/checkpoints/steps_10000"
 ```
 
-SIMPLE 续训使用其对应脚本、数据路径、run 名称和累积步数 `32`。独立 `.pt` 文件用于部署或通过 `trainer.pretrained_checkpoint` 初始化模型权重；完整续训使用上述状态目录。
+SIMPLE 续训使用其对应脚本、数据路径、run 名称和累积步数 `32`。辅助损失变体使用原预设续训，例如七项损失运行使用 `full`；具体命令见 [消融实验](docs/ablations.md)。独立 `.pt` 文件用于部署或通过 `trainer.pretrained_checkpoint` 初始化模型权重；完整续训使用上述状态目录。
 
 ## 部署
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m deployment.model_server.server_policy \
-  --ckpt_path "${OUTPUT_ROOT}/sonic_learned_goal_8xa100/checkpoints/steps_40000_pytorch_model.pt" \
+  --ckpt_path "${OUTPUT_ROOT}/sonic_learned_goal_core_8xa100/checkpoints/steps_40000_pytorch_model.pt" \
   --cuda 0 --use_bf16 --port 10093
 ```
 
