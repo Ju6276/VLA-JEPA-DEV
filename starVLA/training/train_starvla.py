@@ -29,7 +29,6 @@ import time
 # Third-Party Libraries
 import torch
 import torch.distributed as dist
-import wandb
 import yaml
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
@@ -52,6 +51,7 @@ from starVLA.training.trainer_utils.runtime import (
     resolve_resume_path,
     save_training_checkpoint,
 )
+from starVLA.training.trainer_utils.wandb_tracking import initialize_wandb
 
 deepspeed_plugin = DeepSpeedPlugin()
 accelerator = Accelerator(
@@ -220,8 +220,8 @@ class VLATrainer(TrainerUtils):
             raise ValueError("The training dataloader contains no batches")
         self.accelerator.register_for_checkpointing(self.lr_scheduler, self.progress)
 
-        self._init_wandb()
         self._init_checkpointing()
+        self._init_wandb()
 
     def _calculate_total_batch_size(self):
         """calculate global batch size"""
@@ -233,14 +233,17 @@ class VLATrainer(TrainerUtils):
 
     def _init_wandb(self):
         """initialize Weights & Biases"""
+        self.wandb_run = None
+        initialization_error = [None]
         if self.accelerator.is_main_process:
-            wandb.init(
-                name=self.config.run_id,
-                dir=os.path.join(self.config.output_dir, "wandb"),
-                project=self.config.wandb_project,
-                entity=self.config.wandb_entity,
-                group="vla-train",
-            )
+            try:
+                self.wandb_run = initialize_wandb(self.config, resume_path=self.resume_path)
+            except Exception as error:
+                initialization_error[0] = f"{type(error).__name__}: {error}"
+        if dist.is_initialized():
+            dist.broadcast_object_list(initialization_error, src=0)
+        if initialization_error[0] is not None:
+            raise RuntimeError(f"W&B initialization failed: {initialization_error[0]}")
 
     def _init_checkpointing(self):
         """initialize checkpoint directory"""
@@ -276,7 +279,8 @@ class VLATrainer(TrainerUtils):
 
     def _log_metrics(self, metrics):
         """record training metrics"""
-        if self.completed_steps % self.config.trainer.logging_frequency == 0:
+        if (self.completed_steps % self.config.trainer.logging_frequency == 0
+                or "mae_score" in metrics or "mse_score" in metrics):
             if self.accelerator.is_main_process:
                 # add learning rate
                 metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
@@ -287,7 +291,8 @@ class VLATrainer(TrainerUtils):
                 )
 
                 # record to W&B
-                wandb.log(metrics, step=self.completed_steps)
+                if self.wandb_run is not None:
+                    self.wandb_run.log(dict(metrics, optimizer_step=self.completed_steps))
                 # Keep the same metrics available without a W&B service.
                 # These describe the main rank's latest microbatch, matching
                 # the existing W&B values; action diagnostics are rank-reduced.
@@ -508,7 +513,8 @@ class VLATrainer(TrainerUtils):
 
         # close W&B
         if self.accelerator.is_main_process:
-            wandb.finish()
+            if self.wandb_run is not None:
+                self.wandb_run.finish()
             self.writer.close()
 
         self.accelerator.wait_for_everyone()

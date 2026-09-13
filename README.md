@@ -145,14 +145,18 @@ SIMPLE 的完整操作步骤见 [8×A100 中文训练指南](README_8XA100_中�
 在已激活的环境中设置公共参数：
 
 ```bash
+wandb login
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export NUM_PROCESSES=8
 export OUTPUT_ROOT=/path/to/checkpoints
-export WANDB_MODE=offline
+export WANDB_MODE=online
+export WANDB_PROJECT=SPATIAL_JEPA
 export NUM_WORKERS=4
 export OMP_NUM_THREADS=4
 export FFMPEG_THREADS=1
 ```
+
+W&B 在线记录到 `WANDB_PROJECT` 指定的项目；团队工作区可设置 `WANDB_ENTITY`。首次使用 `wandb login` 登录，凭据由 W&B CLI 管理。离线训练设置 `WANDB_MODE=offline`，本地指标仍写入 TensorBoard 和 `metrics.jsonl`。
 
 启动器按控制接口选择配置，默认每卡 batch 为 1。有效 batch = GPU 数 × 每卡 batch × 梯度累积步数。可根据设备显存与存储吞吐调整每卡 batch 和累积步数；`NUM_WORKERS` 是每个训练进程的数据加载进程数。
 
@@ -209,6 +213,7 @@ DATA_ROOT="${SIMPLE_DATA_ROOT}" RUN_ID=simple_spatial_aux \
 ├── config.yaml
 ├── config.json
 ├── dataset_statistics.json
+├── wandb_run.json                  # W&B run ID 与工作区
 ├── metrics.jsonl                   # loss、学习率等训练指标
 ├── summary.jsonl                   # checkpoint 保存步数
 ├── tensorboard/
@@ -227,7 +232,7 @@ DATA_ROOT="${SIMPLE_DATA_ROOT}" RUN_ID=simple_spatial_aux \
 tensorboard --logdir "${OUTPUT_ROOT}" --port 6006
 ```
 
-每 10 次更新记录一次 loss 和学习率，同时写入 TensorBoard、`metrics.jsonl` 和 W&B。loss 为主进程最近一个 microbatch 的值。每 500 次更新计算当前训练 batch 的动作 MAE / MSE，并在训练进程间归约；任务成功率在仿真或真机执行时单独评估。
+每 10 次更新记录一次 loss 和学习率，同时写入 TensorBoard、`metrics.jsonl` 和 W&B。loss 为主进程最近一个 microbatch 的值。每 500 次更新计算当前训练 batch 的动作 MAE / MSE，并在训练进程间归约、单独记录；任务成功率在仿真或真机执行时单独评估。W&B 保存本次实际训练配置，曲线横轴使用 `optimizer_step`。
 
 续训使用 `steps_N/` 完整状态目录，恢复模型、优化器、学习率调度、随机状态、训练步数与数据位置。沿用原训练的数据、每卡 batch、GPU 数、累积步数和训练配置，保持 Qwen 与 V-JEPA 权重路径可访问。以下为 SIMPLE 从第 10,000 次更新继续到第 40,000 次更新：
 
@@ -244,6 +249,8 @@ PER_DEVICE_BATCH_SIZE=1 \
 ```
 
 SONIC 续训使用 `scripts/train_spatial_goal.sh sonic`、SONIC 数据路径、对应 run 名称和累积步数 `4`。续训沿用原 run 的空间模块参数、历史采样与损失权重；可设置 `CONFIG_YAML="${OUTPUT_ROOT}/${RUN_ID}/config.yaml"` 读取保存的配置。独立 `.pt` 文件用于部署或通过 `trainer.pretrained_checkpoint` 初始化模型权重；完整续训使用上述状态目录。
+
+在线续训会读取 run 目录的 `wandb_run.json`，继续记录到同一 W&B run；显式设置的 `WANDB_PROJECT`、`WANDB_ENTITY` 应与原实验一致。回到较旧 checkpoint 时保留已有记录，新增曲线仍按实际 `optimizer_step` 显示。迁移实验时一起复制该文件；旧版实验可设置 `WANDB_RUN_ID` 为原 W&B run 的 ID 来关联。
 
 ## 部署
 

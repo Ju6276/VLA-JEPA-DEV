@@ -8,6 +8,7 @@
 
 ```bash
 conda activate VLA_JEPA
+wandb login
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export NUM_PROCESSES=8
 export QWEN_MODEL=/path/to/models/Qwen3-VL-2B-Instruct
@@ -15,11 +16,14 @@ export VJEPA21_CKPT=/path/to/models/vjepa2_1_vitl_dist_vitG_384.pt
 export DATA_ROOT=/path/to/simple_data
 export OUTPUT_ROOT=/path/to/checkpoints
 export RUN_ID=simple_spatial_goal_8xa100
-export WANDB_MODE=offline
+export WANDB_MODE=online
+export WANDB_PROJECT=SPATIAL_JEPA
 export NUM_WORKERS=4
 export OMP_NUM_THREADS=4
 export FFMPEG_THREADS=1
 ```
+
+`wandb login` 用于首次登录。在线曲线记录到 `SPATIAL_JEPA` 项目；团队工作区可另设置 `export WANDB_ENTITY=你的团队名称`。凭据由 W&B CLI 管理。
 
 数据根目录结构：
 
@@ -74,6 +78,7 @@ ${OUTPUT_ROOT}/${RUN_ID}/
 ├── config.yaml
 ├── config.json
 ├── dataset_statistics.json
+├── wandb_run.json                 # W&B run ID 与工作区
 ├── metrics.jsonl                  # loss、学习率等训练指标
 ├── summary.jsonl                  # checkpoint 保存步数
 ├── tensorboard/
@@ -96,7 +101,7 @@ tensorboard --logdir "${OUTPUT_ROOT}/${RUN_ID}/tensorboard" --port 6006
 tail -f "${OUTPUT_ROOT}/${RUN_ID}/metrics.jsonl"
 ```
 
-loss 记录主进程最近一个 microbatch 的值；动作误差诊断在各训练进程间归约。`WANDB_MODE=offline` 将 W&B 数据保存在本地；在线记录可先 `wandb login`，再设置 `WANDB_MODE=online`。
+W&B 上传实际训练配置、loss、学习率、数据读取与计算耗时，以及定期动作 MAE / MSE；曲线横轴使用 `optimizer_step`。8 个训练进程共用一个云端 run，由主进程记录。loss 为主进程最近一个 microbatch 的值，动作误差诊断在各训练进程间归约。需要离线记录时设置 `WANDB_MODE=offline`，本地 TensorBoard 与 `metrics.jsonl` 保持可用。
 
 ## 4. 从 checkpoint 续训
 
@@ -114,6 +119,8 @@ PER_DEVICE_BATCH_SIZE=1 \
 ```
 
 `steps_10000/` 恢复模型、优化器、学习率调度、随机状态、训练步数与数据位置。独立 `.pt` 文件用于部署，或通过 `--trainer.pretrained_checkpoint /path/to/model.pt` 初始化新训练的模型权重。
+
+在线续训自动读取 run 目录的 `wandb_run.json`，继续使用原 W&B run；`WANDB_PROJECT`、`WANDB_ENTITY` 保持与原实验一致。迁移训练时一同保留该文件。恢复较旧 checkpoint 会保留已有曲线，并记录恢复后的实际训练步数。旧版实验可设置 `WANDB_RUN_ID` 为原云端 run 的 ID；缺少身份记录时创建新的 W&B run。
 
 ## 5. 启动 SIMPLE 推理服务
 

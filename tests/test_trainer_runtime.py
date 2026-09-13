@@ -257,7 +257,6 @@ def test_training_metrics_are_available_offline_at_the_configured_update_interva
     logged = []
     log_metrics = _trainer_function("_log_metrics", {
         "os": os, "json": json,
-        "wandb": SimpleNamespace(log=lambda metrics, step: logged.append((dict(metrics), step))),
         "logger": SimpleNamespace(info=lambda *args: None),
     }, class_name="VLATrainer")
     writer = SummaryWriter(tmp_path / "tensorboard")
@@ -268,6 +267,7 @@ def test_training_metrics_are_available_offline_at_the_configured_update_interva
         lr_scheduler=SimpleNamespace(get_last_lr=lambda: [1e-5]),
         progress=TrainingProgress(data_epoch=2, batches_in_epoch=3),
         vla_train_dataloader=[None] * 10,
+        wandb_run=SimpleNamespace(log=lambda values: logged.append(dict(values))),
     )
     metrics = {"action_loss": 0.7, "wm_loss": 0.2, "goal_prediction_spatial_component": 0.03}
     log_metrics(trainer, dict(metrics))
@@ -284,11 +284,35 @@ def test_training_metrics_are_available_offline_at_the_configured_update_interva
     writer.close()
     records = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
     assert records == [dict(metrics, learning_rate=1e-5, epoch=2.3, step=10)]
-    assert logged == [(dict(metrics, learning_rate=1e-5, epoch=2.3), 10)]
+    assert logged == [dict(metrics, learning_rate=1e-5, epoch=2.3, optimizer_step=10)]
     events = EventAccumulator(str(tmp_path / "tensorboard")).Reload()
     assert events.Scalars("action_loss")[0].step == 10
     assert events.Scalars("goal_prediction_spatial_component")[0].value == pytest.approx(0.03)
     assert len(events.Scalars("mae_score")) == len(events.Scalars("mse_score")) == 1
+
+
+@pytest.mark.parametrize("wandb_enabled", [False, True])
+def test_action_diagnostics_are_logged_between_training_log_intervals(tmp_path, wandb_enabled):
+    logged = []
+    log_metrics = _trainer_function("_log_metrics", {
+        "os": os, "json": json, "logger": SimpleNamespace(info=lambda *args: None),
+    }, class_name="VLATrainer")
+    trainer = SimpleNamespace(
+        completed_steps=5, writer=None,
+        config=SimpleNamespace(output_dir=str(tmp_path), trainer=SimpleNamespace(logging_frequency=10)),
+        accelerator=SimpleNamespace(is_main_process=True),
+        lr_scheduler=SimpleNamespace(get_last_lr=lambda: [1e-5]),
+        progress=TrainingProgress(), vla_train_dataloader=[None],
+        wandb_run=SimpleNamespace(log=lambda values: logged.append(values)) if wandb_enabled else None,
+    )
+    log_metrics(trainer, {"action_loss": 0.8})
+    assert not (tmp_path / "metrics.jsonl").exists()
+    log_metrics(trainer, {"action_loss": 0.8, "mae_score": 0.3, "mse_score": 0.2})
+    record = json.loads((tmp_path / "metrics.jsonl").read_text())
+    assert record["step"] == 5 and record["mae_score"] == 0.3
+    assert len(logged) == int(wandb_enabled)
+    if wandb_enabled:
+        assert logged[0]["optimizer_step"] == 5
 
 
 def test_configure_actual_accelerate_and_deepspeed_accumulation_and_clipping():
