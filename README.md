@@ -1,4 +1,4 @@
-# JEPA Spatial Goal
+# SpatialGoal-JEPA: Task-Conditioned Spatial Goals for Humanoid Mobile Manipulation
 
 面向单目 ego 视觉移动操作的视觉语言动作框架。模型从当前观测、指令、机器人状态与真实观测历史预测全局及空间 subgoal latent，解码动作 chunk，并根据候选动作的未来视觉进展与序列一致性选择动作。
 
