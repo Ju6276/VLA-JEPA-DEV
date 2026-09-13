@@ -474,6 +474,11 @@ class VLATrainer(TrainerUtils):
             self.optimizer.zero_grad()
             
             result_dict = {k: v.item() for k, v in output_dict.items()}
+            # Components are diagnostics, already included in goal_prediction_loss.
+            # Keep them outside output_dict so they are never summed twice.
+            unwrapped = self.accelerator.unwrap_model(self.model)
+            result_dict.update({k: v.item() for k, v in
+                                getattr(unwrapped, "spatial_training_metrics", {}).items()})
 
         return result_dict
 

@@ -25,6 +25,7 @@ logger = initialize_overwatch(__name__)
 IGNORE_INDEX = -100
 
 from starVLA.model.framework.base_framework import baseframework
+from starVLA.model.framework.spatial_jepa import SpatialJEPAMixin
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
@@ -45,7 +46,7 @@ from starVLA.tools.subgoal_tracker import SubgoalTracker
 GoalImage = Union[Image.Image, List[Image.Image]]
 
 @FRAMEWORK_REGISTRY.register("VLA_JEPA")
-class VLA_JEPA(baseframework):
+class VLA_JEPA(SpatialJEPAMixin, baseframework):
     """
     Multimodal vision-language-action model.
 
@@ -228,6 +229,7 @@ class VLA_JEPA(baseframework):
             self.goal_action_proposal = None
             self.goal_predictor = None
 
+        self._init_spatial_goal()
         self.subgoal_tracker: Optional[SubgoalTracker] = None
         if self.subgoals_path:
             self.load_subgoal_tracker(self.subgoals_path, precompute_latents=False)
@@ -422,7 +424,9 @@ class VLA_JEPA(baseframework):
         # Learned goals use the same image preprocessing as their current-frame
         # inputs. Legacy priors retain their original goal images for the JEPA
         # processor, rather than first resizing them to the VLA observation size.
-        if self.use_learned_goal:
+        if self.use_spatial_goal:
+            goal_batch = self._spatial_images(goal_batch)
+        elif self.use_learned_goal:
             image_size = self.config.datasets.vla_data.get("image_size", None)
             if image_size:
                 goal_batch = resize_images(goal_batch, target_size=image_size)
@@ -612,6 +616,7 @@ class VLA_JEPA(baseframework):
 
         """
         batch_images = [example["image"] for example in examples]  # [B, [PIL.Image]]
+        self.spatial_training_metrics = {}
         batch_videos = [example["video"] for example in examples]  #  [B, V, T, H, W, 3]
         instructions = [example["lang"] for example in examples]  # [B, str]
         actions = [example["action"]for example in examples] if "action" in examples[0] else None # label [B， len, 7]
@@ -688,7 +693,10 @@ class VLA_JEPA(baseframework):
         
             # Step 2: JEPA Encoder
             learned_goal_training = self.use_learned_goal and actions is not None
-            if learned_goal_training:
+            if learned_goal_training and self.use_spatial_goal:
+                video_embeddings, goal_target_tokens = self._encode_spatial_training_pair(examples, batch_videos)
+                T = self.num_temporal_frames
+            elif learned_goal_training:
                 video_embeddings, goal_target_tokens = self._encode_training_goal_pair(batch_images, batch_videos)
                 T = self.num_temporal_frames
             else:
@@ -788,6 +796,10 @@ class VLA_JEPA(baseframework):
                 )
                 proposal_z_goal = pool_vjepa_tokens(gt_states)
                 predicted_goal = None
+                spatial = (
+                    self._spatial_train_outputs(examples, video_embeddings, gt_states, embodied_action_tokens, state_tensor)
+                    if self.use_spatial_goal else None
+                )
                 if self.goal_predictor is not None:
                     predicted_goal = self.goal_predictor(
                         proposal_z_current.detach(), embodied_action_tokens, state_tensor
@@ -795,17 +807,30 @@ class VLA_JEPA(baseframework):
                     output["goal_prediction_loss"] = (
                         1.0 - F.cosine_similarity(predicted_goal.float(), proposal_z_goal.detach().float(), dim=-1)
                     ).mean() * self.lambda_goal_prediction
+                    if spatial is not None:
+                        global_loss = output["goal_prediction_loss"]
+                        spatial_loss = spatial["loss"] * self.lambda_goal_prediction * self.spatial_goal_weight
+                        self.spatial_training_metrics = {
+                            "goal_prediction_global_component": global_loss.detach(),
+                            "goal_prediction_spatial_component": spatial_loss.detach(),
+                        }
+                        output["goal_prediction_loss"] = global_loss + spatial_loss
                 if self.goal_action_proposal is not None:
-                    proposal_loss = self.goal_action_proposal.loss(
+                    true_proposal = self.goal_action_proposal(
                         proposal_z_current.detach(),
                         proposal_z_goal.detach(),
                         state_tensor,
-                        actions_target,
                     )
+                    if spatial is not None:
+                        true_proposal = true_proposal + spatial["true_residual"].to(true_proposal)
+                    proposal_loss = F.mse_loss(true_proposal, actions_target.to(true_proposal))
                     if predicted_goal is not None:
-                        predicted_goal_loss = self.goal_action_proposal.loss(
-                            proposal_z_current.detach(), predicted_goal.detach(), state_tensor, actions_target
+                        predicted_proposal = self.goal_action_proposal(
+                            proposal_z_current.detach(), predicted_goal.detach(), state_tensor
                         )
+                        if spatial is not None:
+                            predicted_proposal = predicted_proposal + spatial["predicted_residual"].to(predicted_proposal)
+                        predicted_goal_loss = F.mse_loss(predicted_proposal, actions_target.to(predicted_proposal))
                         weight = self.goal_proposal_predicted_weight
                         proposal_loss = (1.0 - weight) * proposal_loss + weight * predicted_goal_loss
                     output["goal_proposal_loss"] = proposal_loss * self.lambda_goal_proposal
@@ -829,6 +854,7 @@ class VLA_JEPA(baseframework):
         """
         if reset_subgoals:
             self.reset_subgoal_tracker()
+            self.reset_spatial_memory()
 
         should_verify = self.use_verifier_default if use_verifier is None else bool(use_verifier)
         if should_verify and self.use_delta_jepa:
@@ -841,6 +867,8 @@ class VLA_JEPA(baseframework):
                 **kwargs,
             )
 
+        if self.use_spatial_goal:
+            self.reset_spatial_memory()
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
@@ -894,6 +922,7 @@ class VLA_JEPA(baseframework):
         if not self.use_delta_jepa:
             raise RuntimeError("predict_action_verified requires framework.delta_jepa.enabled=true")
 
+        jepa_images = self._spatial_images(batch_images) if self.use_spatial_goal else None
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
@@ -901,7 +930,7 @@ class VLA_JEPA(baseframework):
         num_candidates = self.verifier_num_candidates if num_candidates is None else num_candidates
         if num_candidates < 1:
             raise ValueError("num_candidates must be at least 1")
-        video_batch = self._images_to_video_batch(batch_images)
+        video_batch = self._images_to_video_batch(jepa_images if jepa_images is not None else batch_images)
         video_embeddings = self._encode_video_batch(video_batch)
         tokens_per_frame = max(1, video_embeddings.shape[1] // self.num_temporal_frames)
         z_current = self._current_visual_latent(video_embeddings)
@@ -921,6 +950,12 @@ class VLA_JEPA(baseframework):
         z_goal, goal_source = self._resolve_verifier_goal(
             z_current, embodied_action_tokens, state_tensor, subgoal_images
         )
+        spatial = (
+            self._spatial_inference_context(
+                video_embeddings, embodied_action_tokens, state_tensor, instructions, goal_source, subgoal_images,
+                **{k: kwargs[k] for k in ("timestamp", "episode_id", "history_images", "history_valid", "history_ages", "update_memory") if k in kwargs},
+            ) if self.use_spatial_goal else None
+        )
 
         if self.goal_action_proposal is not None:
             proposal = self.goal_action_proposal(
@@ -928,6 +963,8 @@ class VLA_JEPA(baseframework):
                 z_goal,
                 state_tensor,
             ).unsqueeze(1)
+            if spatial is not None:
+                proposal = proposal + spatial["residual"].to(proposal).unsqueeze(1)
             sampled_count = max(0, num_candidates - 1)
             if sampled_count:
                 sampled_candidates = self.sample_action_candidates(
@@ -954,6 +991,7 @@ class VLA_JEPA(baseframework):
         candidate_goal_progress = []
         candidate_prior_error = []
         candidate_scores = []
+        candidate_spatial_progress = []
 
         for idx in range(candidates.shape[1]):
             candidate_chunk = candidates[:, idx]
@@ -972,6 +1010,12 @@ class VLA_JEPA(baseframework):
                 goal_progress
                 - self.verifier_action_prior_weight * action_prior_error
             )
+            if spatial is not None:
+                spatial_progress = self._spatial_progress(spatial, predicted_states[:, -tokens_per_frame:])
+                scores = scores.float() + self.spatial_score_weight * spatial_progress
+                candidate_spatial_progress.append(spatial_progress)
+                if not torch.isfinite(scores).all() or not torch.isfinite(candidate_chunk).all():
+                    raise ValueError("Spatial verification produced non-finite candidate actions or scores")
             candidate_goal_progress.append(goal_progress)
             candidate_prior_error.append(action_prior_error)
             candidate_scores.append(scores)
@@ -979,7 +1023,7 @@ class VLA_JEPA(baseframework):
             best_scores = torch.where(better, scores, best_scores)
             best_actions = torch.where(better.unsqueeze(-1).unsqueeze(-1), candidate_chunk, best_actions)
 
-        return {
+        result = {
             "normalized_actions": best_actions.float().cpu().numpy(),
             "verification_scores": best_scores.float().cpu().numpy(),
             "all_candidates": candidates.float().cpu().numpy(),
@@ -995,6 +1039,17 @@ class VLA_JEPA(baseframework):
                 self.subgoal_tracker.state_dict() if self.subgoal_tracker is not None else None
             ),
         }
+        if spatial is not None:
+            result.update({
+                "candidate_spatial_progress": torch.stack(candidate_spatial_progress, dim=1).float().cpu().numpy(),
+                "spatial_attention": spatial["attention"].float().cpu().numpy(),
+                "spatial_goal_attention": spatial["goal_attention"].float().cpu().numpy(),
+                "spatial_history_used": spatial["history_used"].long().cpu().numpy(),
+            })
+            if spatial["pending_memory"] is not None:
+                self.spatial_memory.clear()
+                self.spatial_memory.update(spatial["pending_memory"])
+        return result
 
 
 

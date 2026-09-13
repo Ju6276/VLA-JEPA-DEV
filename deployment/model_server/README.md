@@ -1,4 +1,4 @@
-# JEPA Learned Goal 推理服务
+# JEPA Spatial Goal 推理服务
 
 [返回主 README](../../README.md) · [控制接口](../../docs/control_interfaces.md)
 
@@ -6,7 +6,7 @@
 
 ```bash
 python -m deployment.model_server.server_policy \
-  --ckpt_path /path/to/checkpoints/sonic_learned_goal_core_8xa100/checkpoints/steps_40000_pytorch_model.pt \
+  --ckpt_path /path/to/checkpoints/sonic_spatial_goal_8xa100/checkpoints/steps_40000_pytorch_model.pt \
   --cuda 0 --use_bf16 --port 10093
 ```
 
@@ -60,6 +60,8 @@ SIMPLE 输出为 `[30,36]`，SONIC 输出为 `[40,78]`。原始 state 可通过 
 | `action_dim` | 单步动作维度 |
 | `action_horizon` | chunk 长度 |
 | `learned_goal_enabled` | 自动目标是否启用 |
+| `spatial_goal_enabled` | 空间目标、局部动作条件和空间评分是否启用 |
+| `spatial_memory_enabled` | 是否使用真实过去观测 |
 | `use_verifier` | 默认是否启用候选评分 |
 | `num_subgoals` | 加载的外部 subgoal 数量 |
 
@@ -85,13 +87,37 @@ SIMPLE 输出为 `[30,36]`，SONIC 输出为 `[40,78]`。原始 state 可通过 
 | `verification_scores` | `[B]` float32 | 选中候选的分数 |
 | `all_candidates` | `[B,N,H,A]` float32 | 全部候选动作 |
 | `candidate_goal_progress` | `[B,N]` float32 | 每个候选的视觉目标进展 |
+| `candidate_spatial_progress` | `[B,N]` float32 | 空间配置下每个候选的局部目标进展 |
 | `candidate_prior_error` | `[B,N]` float32 | 每个候选的动作 prior 误差 |
 | `candidate_scores` | `[B,N]` float32 | 每个候选的联合分数，与候选顺序一致 |
 | `goal_source` | string | `predicted`、`images` 或 `tracker` |
 | `goal_proposal_used` | bool | 是否包含目标条件 proposal |
 | `subgoal_index` | integer / null | 外部 tracker 的目标位置 |
+| `spatial_attention` | `[B,K,G²]` float32 | 当前任务查询的空间权重，默认 K=4、G=8 |
+| `spatial_goal_attention` | `[B,K,G²]` float32 | 同一任务查询读取目标网格的权重 |
+| `spatial_history_used` | `[B]` integer | 本次使用的有效过去观测数量 |
 
-候选分项复用已有计算，组合公式为 `candidate_scores = candidate_goal_progress - beta * candidate_prior_error`，其中 `beta` 为 checkpoint 配置的 `verifier_action_prior_weight`。分数以模型计算时的精度求得，再转成 float32 导出；复现服务端选择时直接使用 `candidate_scores`，保留混合精度的舍入结果。固定候选集合的评分对照见 [消融实验](../../docs/ablations.md)。
+空间配置的组合公式为 `candidate_scores = candidate_goal_progress + gamma * candidate_spatial_progress - beta * candidate_prior_error`，其中 `gamma` 为 `framework.spatial_goal.score_weight`（默认 0.5），`beta` 为 `verifier_action_prior_weight`（默认 0.1）。全局配置使用全局进展与 prior 两项。分数以模型计算时的精度求得，再转成 float32 导出；复现服务端选择时直接使用 `candidate_scores`，保留混合精度的舍入结果。固定候选集合的评分对照见 [空间方法与消融](../../docs/spatial_goals.md#消融)。
+
+## 真实观测历史
+
+空间配置的在线服务每个连接维护一条轨迹，batch size 为 1。客户端推荐发送相机观测的 `timestamp`（有限数值，单位秒）和 `episode_id`（字符串或整数）。未提供时间戳时使用服务端的单调时钟；两种时钟来源切换时清空历史。
+
+```python
+response = client.infer({
+    "batch_images": [[ego_rgb]],
+    "instructions": [task],
+    "state": normalized_state[None, None, :],
+    "timestamp": observation_timestamp_seconds,
+    "episode_id": "episode-001",
+})
+```
+
+服务器缓存推理请求中的真实图像特征。默认读取约 0.8 秒、0.4 秒前的观测；历史偏移和容差与训练配置一致。新 episode、指令改变、时间回退、过长间隔以及 `client.reset()` 会清空当前连接的历史，新连接独立初始化。缺少某个时间槽时将其标记无效，`spatial_history_used` 可用于确认实际历史数量。
+
+若相机采集频率高于策略调用频率，客户端也可以随请求提供它已经采集的过去图像。使用 `history_images: [[past_rgb_0, past_rgb_1]]`、`history_valid: [[True, True]]`、`history_ages: [[actual_age_0, actual_age_1]]`，并设置 `update_memory: False`；槽位顺序与训练的历史偏移一致，年龄为当前观测与过去观测时间戳之差。该请求使用显式历史且不更新服务器缓存。过去图像不是目标图片，也不需要标注。
+
+采集和请求频率应覆盖训练设定的历史时间槽；执行整个 chunk 后才发请求时，缓存可能较稀疏。若改变历史偏移，应使用相同设置训练。完整的数据与时间定义见 [空间目标说明](../../docs/spatial_goals.md#数据与历史)。
 
 ## 推理控制
 
@@ -121,4 +147,4 @@ payload = {
 
 相对路径以 manifest 所在目录为基准；原单视角 `path` 格式继续支持。pickle 资产中的 `frames` 对应为 `[[goal0_view0, goal0_view1], ...]`。
 
-示范 tracker 可由服务参数 `--subgoals_path /path/to/subgoals` 加载，此参数会在模型构建前覆盖 checkpoint 中保存的路径。tracker 每个连接独立维护一条轨迹，仅支持 batch size 1；批量推理可使用自动目标或逐样本 `subgoal_images`。切换任务时发送 `{"type":"reset","request_id":"reset-001"}`，或调用 `client.reset()`，只重置当前连接的 tracker。新连接从第一个目标开始。
+示范 tracker 可由服务参数 `--subgoals_path /path/to/subgoals` 加载，此参数会在模型构建前覆盖 checkpoint 中保存的路径。tracker 每个连接独立维护一条轨迹，仅支持 batch size 1。切换任务时发送 `{"type":"reset","request_id":"reset-001"}`，或调用 `client.reset()`，重置当前连接的 tracker 与空间历史。新连接从第一个外部目标开始；自动目标模式保持 `subgoals_path: null`。

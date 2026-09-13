@@ -9,13 +9,16 @@ from deployment.model_server import server_policy
 
 
 @pytest.mark.parametrize("override", [None, "/new/goals", ""])
-def test_goal_path_override_is_applied_before_checkpoint_construction(monkeypatch, override):
+@pytest.mark.parametrize("spatial_flags", [None, (True, False), (True, True)])
+def test_goal_path_override_is_applied_before_checkpoint_construction(monkeypatch, override, spatial_flags):
     configured_path = "/old/goals"
     effective_path = configured_path if override is None else override
     calls = []
 
     class Policy:
         def __init__(self):
+            if spatial_flags is not None:
+                self.use_spatial_goal, self.use_spatial_memory = spatial_flags
             self.config = OmegaConf.create({"framework": {
                 "delta_jepa": {"subgoals_path": effective_path},
                 "action_model": {"state_dim": 2, "action_dim": 3, "action_horizon": 4},
@@ -60,3 +63,7 @@ def test_goal_path_override_is_applied_before_checkpoint_construction(monkeypatc
     assert [call[1] for call in calls if call[0] == "load_tracker"] == (
         [effective_path] if effective_path else []
     )
+    metadata = next(call[1] for call in calls if call[0] == "server")
+    expected_flags = spatial_flags or (False, False)
+    assert metadata["spatial_goal_enabled"] is expected_flags[0]
+    assert metadata["spatial_memory_enabled"] is expected_flags[1]

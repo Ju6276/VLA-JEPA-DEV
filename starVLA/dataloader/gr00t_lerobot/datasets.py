@@ -43,6 +43,7 @@ import torch
 import cv2
 
 from starVLA.dataloader.gr00t_lerobot.video import get_all_frames, get_frames_by_timestamps
+from starVLA.dataloader.spatial_history import select_history_indices, validate_history_options
 
 from starVLA.dataloader.gr00t_lerobot.embodiment_tags import EmbodimentTag
 from starVLA.dataloader.gr00t_lerobot.schema import (
@@ -950,6 +951,38 @@ class LeRobotSingleDataset(Dataset):
             video_backend_kwargs=self.video_backend_kwargs,
         )
 
+    def get_spatial_history(
+        self, trajectory_id: int, key: str, base_index: int,
+        offsets_seconds: Sequence[float], tolerance_seconds: float,
+    ) -> dict:
+        """Read past ego frames from the episode already loaded by get_step_data.
+
+        Frames are selected from original timestamps, independently of future
+        video offsets or any removal of pause frames from the sampling index.
+        Missing slots are None and must receive masked current-image padding.
+        """
+        if self.curr_traj_data is None or "timestamp" not in self.curr_traj_data:
+            raise ValueError("Spatial history requires episode timestamp data")
+        if not key.startswith("video."):
+            raise ValueError("Spatial history requires a video modality key")
+        timestamps = self.curr_traj_data["timestamp"].to_numpy()
+        indices, valid, ages = select_history_indices(
+            timestamps, base_index, offsets_seconds, tolerance_seconds,
+        )
+        frames = [None] * len(indices)
+        if valid.any():
+            unique_indices, inverse = np.unique(indices[valid], return_inverse=True)
+            decoded = get_frames_by_timestamps(
+                self.get_video_path(trajectory_id, key.removeprefix("video.")).as_posix(),
+                timestamps[unique_indices],
+                video_backend=self.video_backend,
+                video_backend_kwargs=self.video_backend_kwargs,
+            )
+            for slot, decoded_index in zip(np.flatnonzero(valid), inverse):
+                frames[slot] = decoded[decoded_index]
+        return dict(history_frames=frames, history_valid=valid, history_ages=ages,
+                    timestamp=float(timestamps[base_index]))
+
     def get_state_or_action(
         self,
         trajectory_id: int,
@@ -1412,6 +1445,9 @@ class LeRobotMixtureDataset(Dataset):
         metadata_config: dict = {
             "percentile_mixing_method": "min_max",
         },
+        spatial_goal_enabled: bool = False,
+        history_offsets_seconds: Sequence[float] = (-0.8, -0.4),
+        history_tolerance_seconds: float = 0.15,
     ):
         """
         Initialize the mixture dataset.
@@ -1445,6 +1481,13 @@ class LeRobotMixtureDataset(Dataset):
         self.resolution_size = resolution_size
         self.video_resolution_size = video_resolution_size
         self.duplicate_single_view = duplicate_single_view
+        self.spatial_goal_enabled = bool(spatial_goal_enabled)
+        self.history_offsets_seconds = list(history_offsets_seconds)
+        self.history_tolerance_seconds = float(history_tolerance_seconds)
+        if self.spatial_goal_enabled:
+            validate_history_options(self.history_offsets_seconds, self.history_tolerance_seconds)
+            if self.duplicate_single_view or any(len(d.modality_keys["video"]) != 1 for d in datasets):
+                raise ValueError("Spatial goals require one ego camera and duplicate_single_view=false")
 
         # Set properties for sampling
 
@@ -1633,19 +1676,27 @@ class LeRobotMixtureDataset(Dataset):
         for attempt in range(max_retries):
             try:
                 dataset, trajectory_name, step = self.sample_step(index)
-                data = dataset.transforms(dataset.get_step_data(trajectory_name, step))    # video T = 1, action T = horizon
+                raw_data = dataset.get_step_data(trajectory_name, step)
+                spatial_enabled = getattr(self, "spatial_goal_enabled", False)
+                # Spatial supervision and history share unaugmented video
+                # coordinates and JEPA resolution, independent of Qwen resize.
+                raw_videos = ({key: raw_data[key].copy() for key in dataset.modality_keys["video"]}
+                              if spatial_enabled else None)
+                data = dataset.transforms(raw_data)
                 
                 # Process all video keys dynamically
                 videos, images = [], []
                 for i, video_key in enumerate(dataset.modality_keys["video"]):
-                    video = data[video_key] # Shape: (T, H, W, C)
+                    video = raw_videos[video_key] if spatial_enabled else data[video_key]
                     video = self.resize_video_opencv(video, self.video_resolution_size)
                     if len(dataset.modality_keys["video"]) > 2:
                         if i in [0, 2]:
                             videos.append(video)
                     else:
                         videos.append(video)
-                    primary_image = Image.fromarray(video[0]).resize((self.resolution_size, self.resolution_size))
+                    observation_frame = (self.resize_video_opencv(data[video_key][0:1], self.video_resolution_size)[0]
+                                         if spatial_enabled else video[0])
+                    primary_image = Image.fromarray(observation_frame).resize((self.resolution_size, self.resolution_size))
                     images.append(primary_image)
                 if len(dataset.modality_keys["video"]) == 1 and self.duplicate_single_view:
                     videos = [videos[0], videos[0].copy()]
@@ -1659,6 +1710,20 @@ class LeRobotMixtureDataset(Dataset):
                 action = np.concatenate(action, axis=1).astype(np.float16)
 
                 return_dict = dict(action=action, image=images, lang=language, video=videos)
+                if spatial_enabled:
+                    current_image = Image.fromarray(videos[0, 0])
+                    history = dataset.get_spatial_history(
+                        trajectory_name, dataset.modality_keys["video"][0], step,
+                        self.history_offsets_seconds, self.history_tolerance_seconds,
+                    )
+                    history_images = []
+                    for frame in history.pop("history_frames"):
+                        if frame is None:
+                            history_images.append(current_image.copy())
+                        else:
+                            resized = self.resize_video_opencv(np.asarray(frame)[None], self.video_resolution_size)[0]
+                            history_images.append(Image.fromarray(resized))
+                    return_dict.update(jepa_image=[current_image], history_images=history_images, **history)
                 if self.with_state:
                     state = []
                     for state_key in dataset.modality_keys["state"]:

@@ -30,6 +30,28 @@ def wire_roundtrip(value):
     return msgpack_numpy.unpackb(msgpack_numpy.packb(value))
 
 
+class InMemoryConnection:
+    """Drive the real async handler without opening a network port."""
+
+    remote_address = ("test", 0)
+
+    def __init__(self):
+        self.incoming = asyncio.Queue()
+        self.outgoing = asyncio.Queue()
+
+    async def recv(self):
+        frame = await self.incoming.get()
+        if frame is None:
+            raise ConnectionClosedOK(None, None)
+        return frame
+
+    async def send(self, frame):
+        await self.outgoing.put(frame)
+
+    async def close(self, **kwargs):
+        pass
+
+
 def test_numpy_goal_request_through_wire_and_router():
     image = np.arange(8 * 6 * 3, dtype=np.uint8).reshape(8, 6, 3)
     goal = image[::-1].copy()
@@ -137,6 +159,56 @@ def test_state_must_be_finite_before_calling_policy(value):
         assert policy.payload is None
 
 
+@pytest.mark.parametrize("field,value", [
+    ("timestamp", np.nan), ("timestamp", np.inf), ("timestamp", -np.inf),
+    ("timestamp", True), ("timestamp", np.bool_(False)), ("timestamp", None),
+    ("timestamp", "1.5"), ("timestamp", [1.5]), ("timestamp", np.array(1.5)),
+    ("episode_id", True), ("episode_id", np.bool_(False)), ("episode_id", None),
+    ("episode_id", 1.5), ("episode_id", []), ("episode_id", {}),
+])
+def test_invalid_trajectory_metadata_is_rejected_before_policy(field, value):
+    policy = ImagePolicy()
+    server = WebsocketPolicyServer(policy)
+    payload = {"batch_images": [[np.zeros((2, 2, 3), dtype=np.uint8)]], field: value}
+    response = server._route_message(wire_roundtrip({"payload": payload}))
+
+    assert response["ok"] is False
+    assert field in response["error"]["message"]
+    assert policy.payload is None
+    assert server._route_message({"type": "ping"})["ok"] is True
+
+
+@pytest.mark.parametrize("timestamp,episode_id", [(0, "episode-1"), (1.5, 0), (np.float64(2.5), np.int64(3))])
+def test_trajectory_metadata_is_forwarded_without_modifying_request(timestamp, episode_id):
+    policy = ImagePolicy()
+    payload = wire_roundtrip({
+        "batch_images": [[np.zeros((2, 2, 3), dtype=np.uint8)]],
+        "timestamp": timestamp, "episode_id": episode_id,
+    })
+    response = WebsocketPolicyServer(policy)._route_message({"payload": payload})
+
+    assert response["ok"] is True
+    assert policy.payload["timestamp"] == timestamp
+    assert policy.payload["episode_id"] == episode_id
+    assert isinstance(payload["batch_images"][0][0], np.ndarray)
+
+
+@pytest.mark.parametrize("memory_enabled", [False, True])
+def test_batched_requests_require_disabled_spatial_memory(memory_enabled):
+    policy = ImagePolicy()
+    policy.use_spatial_memory = memory_enabled
+    response = WebsocketPolicyServer(policy)._route_message({"payload": {
+        "batch_images": [[np.zeros((2, 2, 3), dtype=np.uint8)] for _ in range(2)],
+    }})
+
+    assert response["ok"] is not memory_enabled
+    if memory_enabled:
+        assert "batch size 1" in response["error"]["message"]
+        assert policy.payload is None
+    else:
+        assert len(policy.payload["batch_images"]) == 2
+
+
 @pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf, 0.5])
 def test_nonfinite_policy_actions_are_not_reported_as_success(value):
     class ActionPolicy:
@@ -221,31 +293,10 @@ def test_websocket_handlers_isolate_tracker_progress_and_recover_from_bad_reques
         def reset_subgoal_tracker(self):
             self.subgoal_tracker.reset()
 
-    class Connection:
-        """In-memory transport drives the actual async handler without ports."""
-
-        remote_address = ("test", 0)
-
-        def __init__(self):
-            self.incoming = asyncio.Queue()
-            self.outgoing = asyncio.Queue()
-
-        async def recv(self):
-            frame = await self.incoming.get()
-            if frame is None:
-                raise ConnectionClosedOK(None, None)
-            return frame
-
-        async def send(self, frame):
-            await self.outgoing.put(frame)
-
-        async def close(self, **kwargs):
-            pass
-
     async def exercise():
         policy = TrackedPolicy()
         server = WebsocketPolicyServer(policy)
-        a, b = Connection(), Connection()
+        a, b = InMemoryConnection(), InMemoryConnection()
         handlers = [asyncio.create_task(server._handler(connection)) for connection in (a, b)]
 
         async def request(connection, message):
@@ -278,3 +329,81 @@ def test_websocket_handlers_isolate_tracker_progress_and_recover_from_bad_reques
             await asyncio.gather(*handlers)
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("replace_on_reset", [False, True])
+def test_websocket_handlers_isolate_spatial_memory_across_clients_and_resets(replace_on_reset):
+    original_memory = {"history": ["outside-websocket"]}
+
+    class MemoryPolicy:
+        use_spatial_memory = True
+        spatial_memory = original_memory
+
+        def predict_action(self, **payload):
+            if payload.get("fail"):
+                raise ValueError("request failed")
+            history = self.spatial_memory.setdefault("history", [])
+            history.append((payload["episode_id"], payload["timestamp"]))
+            return {"history": list(history)}
+
+        def reset_spatial_memory(self):
+            if replace_on_reset:
+                self.spatial_memory = {}
+            else:
+                self.spatial_memory.clear()
+
+    async def exercise():
+        policy = MemoryPolicy()
+        server = WebsocketPolicyServer(policy)
+        a, b = InMemoryConnection(), InMemoryConnection()
+        connections = [a, b]
+        handlers = [asyncio.create_task(server._handler(connection)) for connection in connections]
+
+        async def request(connection, message):
+            await connection.incoming.put(msgpack_numpy.packb(message))
+            frame = await asyncio.wait_for(connection.outgoing.get(), timeout=2)
+            assert policy.spatial_memory is original_memory
+            assert original_memory == {"history": ["outside-websocket"]}
+            return msgpack_numpy.unpackb(frame)
+
+        def infer(episode, timestamp, **extra):
+            return {"payload": {
+                "batch_images": [[np.zeros((2, 2, 3), dtype=np.uint8)]],
+                "episode_id": episode, "timestamp": timestamp, **extra,
+            }}
+
+        try:
+            for connection in connections:
+                await asyncio.wait_for(connection.outgoing.get(), timeout=2)
+            assert (await request(a, infer("a", 1)))["data"]["history"] == [["a", 1]]
+            assert (await request(b, infer("b", 1)))["data"]["history"] == [["b", 1]]
+            assert (await request(a, infer("a", 2)))["data"]["history"] == [["a", 1], ["a", 2]]
+            assert (await request(b, {"type": "reset"}))["ok"] is True
+            assert (await request(b, infer("b", 2)))["data"]["history"] == [["b", 2]]
+            assert (await request(a, infer("a", 3, fail=True)))["ok"] is False
+            assert (await request(a, infer("a", 3)))["data"]["history"] == [["a", 1], ["a", 2], ["a", 3]]
+            # Reconnecting starts with empty history, even on the same policy.
+            await a.incoming.put(None)
+            await handlers[0]
+            c = InMemoryConnection()
+            connections.append(c)
+            handlers.append(asyncio.create_task(server._handler(c)))
+            await asyncio.wait_for(c.outgoing.get(), timeout=2)
+            assert (await request(c, infer("a", 4)))["data"]["history"] == [["a", 4]]
+        finally:
+            for connection in connections:
+                await connection.incoming.put(None)
+            await asyncio.gather(*handlers)
+
+    asyncio.run(exercise())
+
+
+def test_spatial_reset_failure_is_reported_to_client():
+    class MemoryPolicy:
+        def reset_spatial_memory(self):
+            raise ValueError("cannot reset memory")
+
+    response = WebsocketPolicyServer(MemoryPolicy())._route_message({"type": "reset"})
+    assert response["ok"] is False
+    assert response["type"] == "reset_result"
+    assert response["error"]["message"] == "cannot reset memory"

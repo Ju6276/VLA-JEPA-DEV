@@ -97,7 +97,7 @@ def make_model(monkeypatch):
     monkeypatch.setattr(framework, "VisionTransformerPredictorAC", TinyWorldPredictor)
     monkeypatch.setattr(framework.VLA_JEPA, "expand_tokenizer", lambda *a, **kw: (["<action>"], [1], 2))
 
-    def build(learned=True, action_dim=3, state_dim=2, horizon=4, proposal=True, num_views=1):
+    def build(learned=True, action_dim=3, state_dim=2, horizon=4, proposal=True, num_views=1, spatial=None):
         cfg = OmegaConf.create({
             "framework": {
                 "action_model": {
@@ -119,6 +119,8 @@ def make_model(monkeypatch):
         })
         if learned:
             cfg.framework.delta_jepa.learned_goal_enabled = True
+        if spatial is not None:
+            cfg.framework.spatial_goal = spatial
         return framework.VLA_JEPA(cfg)
 
     return build

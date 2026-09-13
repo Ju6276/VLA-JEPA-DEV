@@ -107,6 +107,9 @@ def get_vla_dataset(
         resolution_size=data_cfg.get("resolution_size", 224),
         video_resolution_size=data_cfg.get("video_resolution_size", 256),
         duplicate_single_view=data_cfg.get("duplicate_single_view", True),
+        spatial_goal_enabled=data_cfg.get("spatial_goal_enabled", False),
+        history_offsets_seconds=data_cfg.get("history_offsets_seconds", [-0.8, -0.4]),
+        history_tolerance_seconds=data_cfg.get("history_tolerance_seconds", 0.15),
         seed=seed,
         **kwargs,
     )

@@ -61,6 +61,8 @@ def main(args) -> None:
             "env": "g1_humanoid",
             "use_verifier": bool(getattr(vla, "use_verifier_default", False)),
             "learned_goal_enabled": bool(getattr(vla, "use_learned_goal", False)),
+            "spatial_goal_enabled": bool(getattr(vla, "use_spatial_goal", False)),
+            "spatial_memory_enabled": bool(getattr(vla, "use_spatial_memory", False)),
             "state_dim": getattr(action_cfg, "state_dim", None),
             "action_dim": getattr(action_cfg, "action_dim", None),
             "action_horizon": getattr(action_cfg, "action_horizon", None),

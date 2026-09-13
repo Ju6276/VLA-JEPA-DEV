@@ -1,52 +1,59 @@
-# JEPA Learned Goal
+# JEPA Spatial Goal
 
-基于潜在视觉目标的视觉语言动作框架。模型从当前图像、任务指令和机器人状态预测未来目标，在 JEPA 特征空间评估候选动作的执行结果，输出动作 chunk。
+面向单目 ego 视觉移动操作的视觉语言动作框架。模型从当前观测、指令、机器人状态与真实观测历史预测全局及空间 subgoal latent，解码动作 chunk，并根据候选动作的未来视觉进展与序列一致性选择动作。
 
 ## 方法
 
 ```mermaid
 flowchart TD
-    I[当前图像] --> E[V-JEPA 2.1 编码器]
-    I --> Q[Qwen 图像与语言条件]
+    I[当前 ego 图像] --> E[冻结 V-JEPA 2.1]
+    I --> Q[Qwen 图像与指令条件]
     L[任务指令] --> Q
-    E --> G[视觉目标预测器]
+    E --> G[全局目标预测]
+    E --> S[8×8 空间目标预测]
+    H[过去真实观测的特征缓存] --> S
     Q --> G
-    S[机器人状态] --> G
-    E --> P[目标条件动作 proposal]
-    G --> P
-    S --> P
-    Q --> A[Action Expert]
+    Q --> S
+    R[机器人 state] --> G
+    R --> S
+    E --> A[任务与 state 条件空间读取]
     S --> A
+    Q --> A
+    R --> A
+    G --> P[目标条件动作 proposal]
+    A --> P
+    Q --> X[Action Expert]
+    R --> X
     P --> C[候选动作集合]
-    A --> C
-    E --> W[动作条件世界模型]
+    X --> C
+    C --> W[动作条件世界模型]
+    E --> W
     Q --> W
-    C --> W
-    C --> R[GRU 动作序列评分]
-    S --> R
-    G --> V[目标进展与动作一致性评分]
-    E --> V
-    W --> V
-    R --> V
+    C --> D[状态条件 GRU prior]
+    R --> D
+    W --> V[全局进展 + 空间进展 − prior 误差]
+    G --> V
+    A --> V
+    D --> V
     V --> O[动作 chunk]
 ```
 
-**目标预测。** 冻结的 V-JEPA 2.1 提取当前视觉特征，与 Qwen 的图像／指令条件特征及 state 一起输入 MLP，输出未来视觉目标 latent。训练目标从示范未来帧自动构造；部署时由当前输入直接预测。
+**空间目标。** 当前 JEPA patch 特征固定汇聚为 8×8 网格，空间预测器结合指令、state 与过去观测，预测同一时间跨度的未来网格。全局目标预测器同时输出整体视觉目标。未来示范帧通过冻结编码器自动生成监督，直接使用已有 RGB、指令、state 与 action，无需框、mask、物体 ID 或预先提取的 subgoal 文件。
 
-**动作生成。** 目标条件 proposal 根据当前视觉特征、预测目标和 state 生成一个候选，Action Expert 生成其余候选，默认共 8 个。
+**目标条件动作。** 任务与 state 生成 4 个空间查询，从当前和目标网格读取局部特征。局部动作适配器输出完整 chunk 的残差，与全局目标条件 proposal 相加；Action Expert 生成其余候选，默认共 8 个。空间读取器通过动作重建损失与策略模块一起训练。
 
-**动作验证。** 世界模型预测各个候选对应的未来视觉特征，以接近预测目标的程度衡量任务进展。GRU 根据当前 state 和前序动作预测下一步动作，其误差作为动作序列一致性评分。两项合并后选出动作 chunk。
+**未来评分。** 世界模型用候选动作预测未来 patch 特征。所有候选共享当前任务查询和预测目标，综合全局进展、局部空间进展与 GRU 动作 prior 误差，选择得分最高的动作。
 
-目标、动作监督和世界模型预测使用相同时间跨度。当前帧与未来目标帧独立编码，目标条件动作训练同时使用真实目标与预测目标。默认视觉特征为 1024 维；state、action 维度与 chunk 长度由控制接口配置决定。
+**真实历史。** 默认读取当前时间前 0.8、0.4 秒的观测，使用实际间隔和有效性 mask。训练从同一 episode 视频读取，每个有效历史以 0.25 的概率随机屏蔽，覆盖历史缺失条件；部署缓存已经看到的特征。当前、过去、未来图像分别独立编码。历史用于空间目标预测，想象的候选未来不进入缓存。
 
-主训练配置使用动作学习、未来特征预测、动作先验、目标条件动作重建和目标预测五项有效损失。全局 latent 对齐与单步逆动力学作为辅助损失，提供独立消融预设。网络结构与损失配置见 [方法说明](docs/learned_goals.md)。
+主配置保持五类训练损失，目标预测项包含全局 cosine 与空间 L1 两个独立记录的分量；`delta_loss` 和 `ctrl_loss` 默认权重为零。公式、模块结构和消融方式见 [方法与训练说明](docs/spatial_goals.md)。
 
 ## 环境与安装
 
 以下流程面向 Linux 单机 8×A100，使用 Python 3.10、PyTorch 2.6.0、BF16 和 DeepSpeed ZeRO-2。安装 FlashAttention 需要 CUDA toolkit 与 `nvcc`；可使用 CUDA 12.4，并配置相应 NVIDIA 驱动。
 
 ```bash
-git clone --branch feat/jepa-learned-goal https://github.com/Ju6276/VLA-JEPA-DEV.git
+git clone --branch feat/jepa-spatial-goal https://github.com/Ju6276/VLA-JEPA-DEV.git
 cd VLA-JEPA-DEV
 conda create -n VLA_JEPA python=3.10 -y
 conda activate VLA_JEPA
@@ -80,7 +87,7 @@ export VJEPA21_CKPT="${MODEL_ROOT}/vjepa2_1_vitl_dist_vitG_384.pt"
 
 ## 数据与控制接口
 
-数据使用 LeRobot v2.1 格式。每个训练样本包含当前观测、任务指令、state、动作 chunk 及对应的未来图像。未来图像由数据加载器按时间偏移读取，用于构造目标 latent 监督，无需预先提取 subgoal 文件。
+数据使用 LeRobot v2.1 格式。每个训练样本包含当前观测、任务指令、state、动作 chunk 及对应的未来图像。未来图像由数据加载器按时间偏移读取，用于构造目标 latent 监督；过去图像按 episode 内的时间戳读取。使用原有示范即可训练，无需新增区域标注或离线定位阶段。
 
 | 配置 | SIMPLE | SONIC |
 |---|---|---|
@@ -145,50 +152,49 @@ export OMP_NUM_THREADS=4
 export FFMPEG_THREADS=1
 ```
 
-以下启动示例采用每卡 batch 为 1，通过梯度累积设置有效 batch。有效 batch = GPU 数 × 每卡 batch × 累积步数；可根据显存提高每卡 batch，并同比降低累积步数。`NUM_WORKERS` 是每个训练进程的数据加载进程数，可按 CPU 和存储带宽调整。
+启动器按控制接口选择配置，默认每卡 batch 为 1。有效 batch = GPU 数 × 每卡 batch × 梯度累积步数。可根据设备显存与存储吞吐调整每卡 batch 和累积步数；`NUM_WORKERS` 是每个训练进程的数据加载进程数。
 
-| 启动示例 | GPU 数 | 每卡 batch | 累积步数 | 有效 batch |
+| 配置 | GPU 数 | 每卡 batch | 累积步数 | 有效 batch |
 |---|---:|---:|---:|---:|
-| SIMPLE | 8 | 1 | 32 | 256 |
-| SONIC | 8 | 1 | 4 | 32 |
+| [SIMPLE](scripts/config/vlajepa_simple_spatial_goal.yaml) | 8 | 1 | 32 | 256 |
+| [SONIC](scripts/config/vlajepa_sonic_spatial_goal.yaml) | 8 | 1 | 4 | 32 |
 
-**训练 SIMPLE。** 使用 [SIMPLE 配置](scripts/config/vlajepa_g1_pick_between_tables_vjepa21_8xa100.yaml)：
+**SIMPLE：**
 
 ```bash
 DATA_ROOT="${SIMPLE_DATA_ROOT}" \
-RUN_ID=simple_learned_goal_core_8xa100 \
-PER_DEVICE_BATCH_SIZE=1 \
-  bash scripts/train_g1_delta_jepa_8xa100.sh \
-    --trainer.gradient_accumulation_steps 32 \
-    --trainer.max_train_steps 40000 \
-    --trainer.save_interval 10000
+  bash scripts/train_spatial_goal.sh simple
 ```
 
-**训练 SONIC。** 使用 [SONIC 配置](scripts/config/vlajepa_sonic_latent_learned_goal.yaml)：
+**SONIC：**
 
 ```bash
 DATA_ROOT="${SONIC_DATA_ROOT}" \
-RUN_ID=sonic_learned_goal_core_8xa100 \
-PER_DEVICE_BATCH_SIZE=1 \
-  bash scripts/train_sonic_learned_goal.sh \
-    --trainer.gradient_accumulation_steps 4 \
-    --trainer.max_train_steps 40000 \
-    --trainer.save_interval 10000
+  bash scripts/train_spatial_goal.sh sonic
 ```
 
-两个命令分别占用整机 8 张卡，按所需控制接口选择运行。训练步数按优化器更新计数；默认 warmup 为 2,000 次更新，日志间隔为 10 次更新，动作预测诊断间隔为 500 次更新。默认 seed 为 42，Qwen 与动作模块的学习率分别为 `1e-5`、`1e-4`，V-JEPA 编码器保持冻结。
+两个命令分别占用整机 8 张卡，选择所需接口运行。默认 run 名称分别为 `simple_spatial_goal_8xa100` 与 `sonic_spatial_goal_8xa100`。默认训练 40,000 次优化器更新，warmup 2,000 次，每 10,000 次保存 checkpoint。Qwen 与动作模块的学习率分别为 `1e-5`、`1e-4`，V-JEPA 编码器冻结，其余模块联合训练。
 
-GPU 数通过 `NUM_PROCESSES` 设置；脚本末尾的 `--trainer.*`、`--datasets.*` 参数覆盖训练配置。采样默认保留示范尾段并补齐；可通过 `--datasets.vla_data.require_full_horizon true` 仅采样动作和未来目标都完整的片段。更多配置见 [训练说明](docs/learned_goals.md)。
-
-辅助损失消融使用 `core`、`delta`、`ctrl`、`full` 四个预设；`full` 使用七项损失，其中辅助项权重为 `0.05` 和 `0.02`。例如，在同一份 SIMPLE 数据上启用两项辅助损失：
+环境变量 `RUN_ID`、`PER_DEVICE_BATCH_SIZE`、`NUM_PROCESSES`、`NUM_WORKERS` 控制运行设置。脚本末尾的参数覆盖配置与启动器默认值，例如调整 SIMPLE 的 batch，保持有效 batch 为 256：
 
 ```bash
-DATA_ROOT="${SIMPLE_DATA_ROOT}" PER_DEVICE_BATCH_SIZE=1 SEED=42 \
-  bash scripts/train_learned_goal_ablation.sh simple full \
-    --trainer.gradient_accumulation_steps 32
+DATA_ROOT="${SIMPLE_DATA_ROOT}" RUN_ID=simple_spatial_batch2 PER_DEVICE_BATCH_SIZE=2 \
+  bash scripts/train_spatial_goal.sh simple \
+    --trainer.gradient_accumulation_steps 16
 ```
 
-完整训练矩阵、候选评分对照与实验控制见 [消融实验](docs/ablations.md)。
+采样默认保留示范尾段并补齐；`--datasets.vla_data.require_full_horizon true` 仅保留动作和未来目标都完整的起始位置。历史缺失独立使用有效性 mask，不因此丢弃 episode 开头。时间偏移按秒配置，与部署缓存使用相同采样规则。
+
+全局 latent 位移与逆动力学辅助项可分别启用：
+
+```bash
+DATA_ROOT="${SIMPLE_DATA_ROOT}" RUN_ID=simple_spatial_aux \
+  bash scripts/train_spatial_goal.sh simple \
+    --framework.delta_jepa.lambda_delta 0.05 \
+    --framework.delta_jepa.lambda_ctrl 0.02
+```
+
+空间评分、历史条件和辅助项的独立对照见 [消融设计](docs/spatial_goals.md#消融)。
 
 ## 输出与续训
 
@@ -220,33 +226,66 @@ tensorboard --logdir "${OUTPUT_ROOT}" --port 6006
 
 ```bash
 DATA_ROOT="${SONIC_DATA_ROOT}" \
-RUN_ID=sonic_learned_goal_core_8xa100 \
+RUN_ID=sonic_spatial_goal_8xa100 \
 PER_DEVICE_BATCH_SIZE=1 \
-  bash scripts/train_sonic_learned_goal.sh \
+  bash scripts/train_spatial_goal.sh sonic \
     --trainer.gradient_accumulation_steps 4 \
     --trainer.max_train_steps 40000 \
     --trainer.save_interval 10000 \
     --trainer.resume_from_checkpoint \
-    "${OUTPUT_ROOT}/sonic_learned_goal_core_8xa100/checkpoints/steps_10000"
+    "${OUTPUT_ROOT}/sonic_spatial_goal_8xa100/checkpoints/steps_10000"
 ```
 
-SIMPLE 续训使用其对应脚本、数据路径、run 名称和累积步数 `32`。辅助损失变体使用原预设续训，例如七项损失运行使用 `full`；具体命令见 [消融实验](docs/ablations.md)。独立 `.pt` 文件用于部署或通过 `trainer.pretrained_checkpoint` 初始化模型权重；完整续训使用上述状态目录。
+SIMPLE 续训使用 `scripts/train_spatial_goal.sh simple`、SIMPLE 数据路径、对应 run 名称和累积步数 `32`。续训沿用原 run 的空间模块参数、历史采样与损失权重；可设置 `CONFIG_YAML="${OUTPUT_ROOT}/${RUN_ID}/config.yaml"` 读取保存的配置。独立 `.pt` 文件用于部署或通过 `trainer.pretrained_checkpoint` 初始化模型权重；完整续训使用上述状态目录。
 
 ## 部署
 
+使用对应接口训练完成的空间目标 checkpoint 启动服务：
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m deployment.model_server.server_policy \
-  --ckpt_path "${OUTPUT_ROOT}/sonic_learned_goal_core_8xa100/checkpoints/steps_40000_pytorch_model.pt" \
+  --ckpt_path "${OUTPUT_ROOT}/sonic_spatial_goal_8xa100/checkpoints/steps_40000_pytorch_model.pt" \
   --cuda 0 --use_bf16 --port 10093
 ```
 
-客户端发送当前 ego RGB、任务指令和归一化 state。服务返回 `normalized_actions`，客户端按对应统计量反归一化后执行。
+SIMPLE 使用其对应 run 的 checkpoint，命令相同。部署目录保留训练保存的 `config.yaml`、`dataset_statistics.json` 和所选 `.pt` 权重，配置中的 Qwen 与 V-JEPA 路径应可访问；也可使用 `final_model/pytorch_model.pt`。服务按配置构建模型并严格加载权重，新增空间模块需要训练后的参数。
 
-默认自动目标预测与 verifier 开启，`subgoals_path: null`，部署无需外部 subgoal 图片，响应中的 `goal_source` 为 `predicted`。服务加载一份 V-JEPA 编码器并复用其视觉特征。SIMPLE 使用对应 run 的 checkpoint，启动方式相同。
+客户端发送当前 ego RGB、指令、归一化 state，推荐同时提供观测的 `timestamp`（秒）与 `episode_id`。在线模式每条连接维护一个 episode，batch size 为 1。下面示例展示一次请求；连续控制时复用同一连接，更新图像、state 与观测时间：
 
-将模型复制到部署机器时，保留上述 run 目录结构中的 `config.yaml`、`dataset_statistics.json` 与所选 `.pt` 权重，并使配置中的 Qwen 与 V-JEPA 路径在部署机器上可访问。正常结束训练后，也可使用 `final_model/pytorch_model.pt` 部署。
+```python
+import numpy as np
+from PIL import Image
+from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
 
-请求字段、响应格式和客户端示例见 [部署协议](deployment/model_server/README.md)。
+client = WebsocketClientPolicy(host="127.0.0.1", port=10093)
+try:
+    metadata = client.get_server_metadata()
+    image = np.asarray(Image.open("ego.png").convert("RGB"), dtype=np.uint8)
+    state = np.load("normalized_state.npy").astype(np.float32)
+    assert state.shape == (metadata["state_dim"],)
+    response = client.infer({
+        "batch_images": [[image]],
+        "instructions": ["Approach the cup, pick it up, and carry it to the table."],
+        "state": state[None, None, :],
+        "timestamp": 0.0,  # Replace with the current observation timestamp, in seconds.
+        "episode_id": "episode-001",
+    })
+    if not response["ok"]:
+        raise RuntimeError(response["error"]["message"])
+    actions = response["data"]["normalized_actions"][0]
+    assert actions.shape == (metadata["action_horizon"], metadata["action_dim"])
+    client.reset()  # Clear this connection's observation cache before a new episode.
+finally:
+    client.close()
+```
+
+服务复用同一份 V-JEPA 2.1，自动预测 subgoal latent，返回 SIMPLE `[30,36]` 或 SONIC `[40,78]` 的归一化动作。使用该 checkpoint 的统计量恢复控制指令后执行，字段顺序及转换函数见 [控制接口](docs/control_interfaces.md)。
+
+`timestamp` 应使用连续的观测采集时间；不提供时，模型使用服务器处理观测时的单调时钟。任务指令、episode 或时钟来源变化，时间回退或间隔超过 2 秒，都会从新的历史开始。首帧和采样时间附近无观测的历史槽位通过 mask 处理。缓存只在一次推理成功后更新，连接之间相互独立。
+
+按部署观测频率设置历史偏移和时间容差。如果执行完整 chunk 后才采集下一张图像，请求间隔可能较长；对应时间附近没有实际观测时，该槽会被 mask，不将其他帧重复后当作有效历史。
+
+服务元数据包含 `spatial_goal_enabled` 与 `spatial_memory_enabled`。响应提供 `candidate_spatial_progress`、`spatial_attention`、`spatial_goal_attention`、`spatial_history_used`，便于查看动作评分和当前关注位置；请求与返回字段见 [空间推理接口](docs/spatial_goals.md#推理接口)。
 
 ## 致谢
 

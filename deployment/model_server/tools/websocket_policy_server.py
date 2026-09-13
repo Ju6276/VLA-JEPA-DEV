@@ -5,6 +5,8 @@
 import asyncio
 import copy
 import logging
+import math
+import numbers
 import traceback
 
 import numpy as np
@@ -55,6 +57,10 @@ class WebsocketPolicyServer:
         session_tracker = copy.copy(getattr(self._policy, "subgoal_tracker", None))
         if session_tracker is not None:
             session_tracker.reset()
+        # Observation history also belongs to a single connection, never to
+        # the shared checkpoint or a previously connected robot trajectory.
+        has_spatial_memory = hasattr(self._policy, "spatial_memory")
+        session_spatial_memory = {} if has_spatial_memory else None
 
         await websocket.send(packer.pack(self._metadata))
 
@@ -62,15 +68,22 @@ class WebsocketPolicyServer:
             try:
                 msg = msgpack_numpy.unpackb(await websocket.recv())
                 previous_tracker = getattr(self._policy, "subgoal_tracker", None)
+                previous_spatial_memory = getattr(self._policy, "spatial_memory", None)
                 if session_tracker is not None:
                     self._policy.subgoal_tracker = session_tracker
+                if has_spatial_memory:
+                    self._policy.spatial_memory = session_spatial_memory
                 try:
                     # The router is synchronous: no other handler can run while
-                    # this connection's tracker is attached to the shared model.
+                    # this connection's trajectory state is attached to the model.
                     ret = self._route_message(msg)
                 finally:
                     if session_tracker is not None:
                         self._policy.subgoal_tracker = previous_tracker
+                    if has_spatial_memory:
+                        # A reset may replace the dictionary instead of clearing it.
+                        session_spatial_memory = self._policy.spatial_memory
+                        self._policy.spatial_memory = previous_spatial_memory
                 await websocket.send(packer.pack(ret))
             except websockets.ConnectionClosed:
                 logging.info(f"Connection from {websocket.remote_address} closed")
@@ -124,6 +137,8 @@ class WebsocketPolicyServer:
             try:
                 if hasattr(self._policy, "reset_subgoal_tracker"):
                     self._policy.reset_subgoal_tracker()
+                if hasattr(self._policy, "reset_spatial_memory"):
+                    self._policy.reset_spatial_memory()
                 return {
                     "status": "ok",
                     "ok": True,
@@ -155,12 +170,30 @@ class WebsocketPolicyServer:
             try:
                 if payload.get("state") is not None and not np.isfinite(np.asarray(payload["state"])).all():
                     raise ValueError("state must contain only finite values")
-                # Decode both observation and optional goal images without replacing
+                if "timestamp" in payload:
+                    timestamp = payload["timestamp"]
+                    if (
+                        isinstance(timestamp, (bool, np.bool_))
+                        or not isinstance(timestamp, numbers.Real)
+                        or not math.isfinite(timestamp)
+                    ):
+                        raise ValueError("timestamp must be a finite numeric scalar, excluding bool")
+                if "episode_id" in payload:
+                    episode_id = payload["episode_id"]
+                    if isinstance(episode_id, (bool, np.bool_)) or not isinstance(
+                        episode_id, (str, numbers.Integral)
+                    ):
+                        raise ValueError("episode_id must be a string or integer, excluding bool")
+                # Decode observation, goal and explicit past images without replacing
                 # the caller's arrays or modifying the request's nested containers.
                 policy_payload = dict(payload)
                 policy_payload["batch_images"] = image_tools.to_pil_preserve(payload["batch_images"])
+                if getattr(self._policy, "use_spatial_memory", False) and len(policy_payload["batch_images"]) != 1:
+                    raise ValueError("Spatial observation memory requires batch size 1 per connection")
                 if payload.get("subgoal_images") is not None:
                     policy_payload["subgoal_images"] = image_tools.to_pil_preserve(payload["subgoal_images"])
+                if payload.get("history_images") is not None:
+                    policy_payload["history_images"] = image_tools.to_pil_preserve(payload["history_images"])
                 output_dict = self._policy.predict_action(**policy_payload)
                 if "normalized_actions" in output_dict and not np.isfinite(
                     np.asarray(output_dict["normalized_actions"])

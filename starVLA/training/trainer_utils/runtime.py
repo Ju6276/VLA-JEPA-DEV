@@ -57,13 +57,23 @@ def evaluating(model):
 def action_error_metrics(accelerator, model, examples):
     """All ranks evaluate their current batch, then reduce sums and element count."""
     model = accelerator.unwrap_model(model)
+    spatial = bool(getattr(model, "use_spatial_goal", False))
+    predict_kwargs = {}
+    if spatial:
+        # A shuffled training batch is not an online trajectory. Use its actual
+        # past observations without reading/updating the serving connection cache.
+        predict_kwargs["update_memory"] = False
+        if getattr(model, "use_spatial_memory", False):
+            for name in ("history_images", "history_valid", "history_ages"):
+                predict_kwargs[name] = [example[name] for example in examples]
     with evaluating(model), accelerator.autocast():
         output = model.predict_action(
-            batch_images=[example["image"] for example in examples],
+            batch_images=[example["jepa_image"] if spatial else example["image"] for example in examples],
             instructions=[example["lang"] for example in examples],
             state=[example["state"] for example in examples] if "state" in examples[0] else None,
             use_ddim=True,
             num_ddim_steps=20,
+            **predict_kwargs,
         )
     predicted = output["normalized_actions"]
     if torch.is_tensor(predicted):

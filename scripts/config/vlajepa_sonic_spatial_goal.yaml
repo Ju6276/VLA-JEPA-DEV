@@ -1,0 +1,161 @@
+# SONIC real-robot interface: state 46, action 64D motion_token + 14 hand-joint channels.
+# Independent model/checkpoint from the non-SONIC simulation (state 32, action 36).
+# Uses the existing SonicLatentDataConfig; DATA_ROOT must contain merged_dataset_001/.
+run_id: sonic_spatial_goal_8xa100
+run_root_dir: checkpoints
+seed: 42
+trackers:
+- json
+- wandb
+wandb_entity: null
+wandb_project: SPATIAL_JEPA
+is_debug: false
+framework:
+  name: VLA_JEPA
+  qwenvl:
+    base_vlm: Qwen/Qwen3-VL-2B-Instruct
+    attn_implementation: flash_attention_2
+    vl_hidden_dim: 2048
+  action_model:
+    action_model_type: DiT-B
+    action_hidden_dim: 1024
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 78
+    state_dim: 46
+    future_action_window_size: 39
+    action_horizon: 40
+    past_action_window_size: 0
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: 2048
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+  vj2_model:
+    base_encoder: /path/to/vjepa2_1_vitl_dist_vitG_384.pt
+    arch: vit_large
+    image_size: 384
+    num_video_views: 1
+    depth: 12
+    num_heads: 8
+    special_action_token: <|action_{}|>
+    num_action_tokens_per_timestep: 8
+    embodied_action_token: <|embodied_action|>
+    num_embodied_action_tokens_per_instruction: 32
+    num_frames: 8
+  delta_jepa:
+    # Five main loss groups; enable delta/ctrl through explicit CLI overrides.
+    enabled: true
+    blend_vlm_tokens: true
+    lambda_wm: 0.1
+    lambda_delta: 0.0
+    lambda_ctrl: 0.0
+    lambda_action_prior: 0.01
+    action_prior_num_layers: 2
+    verifier_action_prior_weight: 0.1
+    goal_action_proposal_enabled: true
+    lambda_goal_proposal: 0.01
+    learned_goal_enabled: true
+    lambda_goal_prediction: 0.05
+    goal_proposal_predicted_weight: 0.5
+    ctrl_action_step: first
+    hidden_dim: 512
+    verifier_num_candidates: 8
+    use_verifier: true
+    subgoal_tracking_mode: sequential
+    subgoal_epsilon: 0.15
+    subgoals_path: null
+  spatial_goal:
+    enabled: true
+    grid_size: 8
+    hidden_dim: 256
+    num_heads: 4
+    num_queries: 4
+    goal_weight: 1.0
+    score_weight: 0.5
+    memory_enabled: true
+    history_dropout: 0.25
+    history_offsets_seconds: [-0.8, -0.4]
+    memory_max_gap_seconds: 2.0
+    history_tolerance_seconds: 0.15
+
+  reduce_in_full_precision: true
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /path/to/sonic_data_root
+    data_mix: sonic_merged_dataset_001
+    action_type: motion_token
+    CoT_prompt: Your task is {instruction}. Infer the temporal dynamics from frames
+      {actions} and produce the corresponding policy actions {e_actions}.
+    resolution_size: 224
+    image_size:
+    - 224
+    - 224
+    video_resolution_size: 384
+    video_frame_offsets:
+    - 0
+    - 6
+    - 12
+    - 18
+    - 24
+    - 30
+    - 35
+    - 40
+    per_device_batch_size: 1
+    load_all_data_for_training: true
+    with_state: true
+    delete_pause_frame: false
+    require_full_horizon: false
+    duplicate_single_view: false
+    # Real past frames in seconds; no region annotations are required.
+    spatial_goal_enabled: ${framework.spatial_goal.enabled}
+    history_offsets_seconds: ${framework.spatial_goal.history_offsets_seconds}
+    history_tolerance_seconds: ${framework.spatial_goal.history_tolerance_seconds}
+    num_workers: 8
+    prefetch_factor: 4
+trainer:
+  repeated_diffusion_steps: 4
+  epochs: 100
+  max_train_steps: 40000
+  num_warmup_steps: 2000
+  save_interval: 10000
+  eval_interval: 500
+  pretrained_checkpoint: null
+  learning_rate:
+    base: 3.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 0.0001
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+    vlm: 0.1
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 4
+  optimizer:
+    name: AdamW
+    betas:
+    - 0.9
+    - 0.95
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
