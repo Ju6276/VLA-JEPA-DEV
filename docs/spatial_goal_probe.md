@@ -118,6 +118,17 @@ python scripts/probe_spatial_goal.py \
 | `spatial_goal_head.pt` | 验证集选出的空间 head 参数及结构信息 |
 | `test_predictions.pt` | 各方法对测试样本的预测 |
 
+查看真实图像、预测空间特征与误差分布：
+
+```bash
+python scripts/visualize_spatial_predictions.py \
+  --features "$PROBE_ROOT/features.pt" \
+  --predictions "$PROBE_ROOT/head_seed42/test_predictions.pt" \
+  --output "$PROBE_ROOT/visualizations"
+```
+
+脚本按 episode ID 顺序均匀选取最多四条测试轨迹，各取中间采样点，不按误差选择。图中包括当前及真实未来 RGB、三种 latent 的统一 PCA 投影，以及复制基线和预测器的逐格 L1 热图。PCA 只在训练特征上拟合，用于展示；所有 latent 共用投影和颜色范围，两种误差共用色阶。彩色 latent 不表示重建的 RGB，误差热图也不表示注意力权重。图导出为 PNG/PDF，并保存样本选择和投影元数据；数据集移动后可用 `--dataset-root` 指定其新目录。
+
 将特征缓存、head 权重和完整预测张量保存在仓库之外的实验目录，发布时使用单独的数据或模型托管位置，不提交到 Git。`spatial_goal_head.pt` 只包含空间预测器，不是可直接启动完整 policy 的 checkpoint。
 
 这个实验回答的是“固定预训练特征下，空间 head 能否学习并泛化未来网格预测”。较低的预测误差不等于抓取成功，也没有单独验证任务区域读取、动作解码或候选排序；这些模块的作用通过完整 policy 的消融和闭环任务实验评估。
