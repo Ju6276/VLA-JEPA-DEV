@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 import ast
+import json
 import os
 from pathlib import Path
 import random
@@ -247,6 +248,47 @@ def test_model_initialization_is_controlled_by_configured_seed():
     config.seed += 1
     third = build(config).state_dict()
     assert any(not torch.equal(first[key], third[key]) for key in first)
+
+
+def test_training_metrics_are_available_offline_at_the_configured_update_interval(tmp_path):
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    from torch.utils.tensorboard import SummaryWriter
+
+    logged = []
+    log_metrics = _trainer_function("_log_metrics", {
+        "os": os, "json": json,
+        "wandb": SimpleNamespace(log=lambda metrics, step: logged.append((dict(metrics), step))),
+        "logger": SimpleNamespace(info=lambda *args: None),
+    }, class_name="VLATrainer")
+    writer = SummaryWriter(tmp_path / "tensorboard")
+    trainer = SimpleNamespace(
+        completed_steps=9, writer=writer,
+        config=SimpleNamespace(output_dir=str(tmp_path), trainer=SimpleNamespace(logging_frequency=10)),
+        accelerator=SimpleNamespace(is_main_process=True),
+        lr_scheduler=SimpleNamespace(get_last_lr=lambda: [1e-5]),
+        progress=TrainingProgress(data_epoch=2, batches_in_epoch=3),
+        vla_train_dataloader=[None] * 10,
+    )
+    metrics = {"action_loss": 0.7, "wm_loss": 0.2, "goal_prediction_spatial_component": 0.03}
+    log_metrics(trainer, dict(metrics))
+    assert not (tmp_path / "metrics.jsonl").exists()
+    trainer.completed_steps = 10
+    trainer.model = None
+    evaluate = _trainer_function("eval_action_model", {
+        "action_error_metrics": lambda *args: {"mae_score": 0.4, "mse_score": 0.3},
+    }, class_name="VLATrainer")
+    metrics = evaluate(trainer, metrics, examples=[])
+    log_metrics(trainer, dict(metrics))
+    trainer.accelerator.is_main_process = False
+    log_metrics(trainer, dict(metrics))
+    writer.close()
+    records = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    assert records == [dict(metrics, learning_rate=1e-5, epoch=2.3, step=10)]
+    assert logged == [(dict(metrics, learning_rate=1e-5, epoch=2.3), 10)]
+    events = EventAccumulator(str(tmp_path / "tensorboard")).Reload()
+    assert events.Scalars("action_loss")[0].step == 10
+    assert events.Scalars("goal_prediction_spatial_component")[0].value == pytest.approx(0.03)
+    assert len(events.Scalars("mae_score")) == len(events.Scalars("mse_score")) == 1
 
 
 def test_configure_actual_accelerate_and_deepspeed_accumulation_and_clipping():

@@ -288,6 +288,18 @@ class VLATrainer(TrainerUtils):
 
                 # record to W&B
                 wandb.log(metrics, step=self.completed_steps)
+                # Keep the same metrics available without a W&B service.
+                # These describe the main rank's latest microbatch, matching
+                # the existing W&B values; action diagnostics are rank-reduced.
+                if self.writer is not None:
+                    for name, value in metrics.items():
+                        # Action diagnostics are written at their own interval.
+                        if name not in ("mae_score", "mse_score"):
+                            self.writer.add_scalar(name, value, self.completed_steps)
+                    self.writer.flush()
+                record = dict(metrics, step=self.completed_steps)
+                with open(os.path.join(self.config.output_dir, "metrics.jsonl"), "a") as stream:
+                    stream.write(json.dumps(record) + "\n")
                 # debug output
                 logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 

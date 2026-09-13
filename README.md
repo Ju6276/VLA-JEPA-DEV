@@ -140,6 +140,8 @@ SIMPLE 的相机字段为 `egocentric`，SONIC 为 `observation.images.ego_view`
 
 ## 单机 8×A100 训练
 
+SIMPLE 的完整操作步骤见 [8×A100 中文训练指南](README_8XA100_中文.md)。以下命令联合训练完整空间目标策略；未来 latent 监督由数据加载器和冻结编码器在训练中生成。
+
 在已激活的环境中设置公共参数：
 
 ```bash
@@ -173,7 +175,9 @@ DATA_ROOT="${SONIC_DATA_ROOT}" \
   bash scripts/train_spatial_goal.sh sonic
 ```
 
-两个命令分别占用整机 8 张卡，选择所需接口运行。默认 run 名称分别为 `simple_spatial_goal_8xa100` 与 `sonic_spatial_goal_8xa100`。默认训练 40,000 次优化器更新，warmup 2,000 次，每 10,000 次保存 checkpoint。Qwen 与动作模块的学习率分别为 `1e-5`、`1e-4`，V-JEPA 编码器冻结，其余模块联合训练。
+两个命令分别占用整机 8 张卡，选择所需接口运行。默认 run 名称分别为 `simple_spatial_goal_8xa100` 与 `sonic_spatial_goal_8xa100`，新实验使用新的 `RUN_ID`。默认训练 40,000 次优化器更新，warmup 2,000 次，每 10,000 次保存 checkpoint。Qwen 与动作模块的学习率分别为 `1e-5`、`1e-4`，V-JEPA 编码器冻结，其余模块联合训练。
+
+SIMPLE 默认将全部 99 个 episode 纳入随机采样，数据读完后继续采样至设定的训练步数。首次启动会生成归一化统计缓存，数据目录需要可写。
 
 环境变量 `RUN_ID`、`PER_DEVICE_BATCH_SIZE`、`NUM_PROCESSES`、`NUM_WORKERS` 控制运行设置。脚本末尾的参数覆盖配置与启动器默认值，例如调整 SIMPLE 的 batch，保持有效 batch 为 256：
 
@@ -205,7 +209,8 @@ DATA_ROOT="${SIMPLE_DATA_ROOT}" RUN_ID=simple_spatial_aux \
 ├── config.yaml
 ├── config.json
 ├── dataset_statistics.json
-├── summary.jsonl
+├── metrics.jsonl                   # loss、学习率等训练指标
+├── summary.jsonl                   # checkpoint 保存步数
 ├── tensorboard/
 ├── wandb/
 ├── checkpoints/
@@ -222,21 +227,23 @@ DATA_ROOT="${SIMPLE_DATA_ROOT}" RUN_ID=simple_spatial_aux \
 tensorboard --logdir "${OUTPUT_ROOT}" --port 6006
 ```
 
-续训使用 `steps_N/` 完整状态目录，恢复模型、优化器、学习率调度、随机状态、训练步数与数据位置。沿用原训练的数据、每卡 batch、GPU 数、累积步数和训练配置，保持 Qwen 与 V-JEPA 权重路径可访问。以下为 SONIC 从第 10,000 次更新继续到第 40,000 次更新：
+每 10 次更新记录一次 loss 和学习率，同时写入 TensorBoard、`metrics.jsonl` 和 W&B。loss 为主进程最近一个 microbatch 的值。每 500 次更新计算当前训练 batch 的动作 MAE / MSE，并在训练进程间归约；任务成功率在仿真或真机执行时单独评估。
+
+续训使用 `steps_N/` 完整状态目录，恢复模型、优化器、学习率调度、随机状态、训练步数与数据位置。沿用原训练的数据、每卡 batch、GPU 数、累积步数和训练配置，保持 Qwen 与 V-JEPA 权重路径可访问。以下为 SIMPLE 从第 10,000 次更新继续到第 40,000 次更新：
 
 ```bash
-DATA_ROOT="${SONIC_DATA_ROOT}" \
-RUN_ID=sonic_spatial_goal_8xa100 \
+DATA_ROOT="${SIMPLE_DATA_ROOT}" \
+RUN_ID=simple_spatial_goal_8xa100 \
 PER_DEVICE_BATCH_SIZE=1 \
-  bash scripts/train_spatial_goal.sh sonic \
-    --trainer.gradient_accumulation_steps 4 \
+  bash scripts/train_spatial_goal.sh simple \
+    --trainer.gradient_accumulation_steps 32 \
     --trainer.max_train_steps 40000 \
     --trainer.save_interval 10000 \
     --trainer.resume_from_checkpoint \
-    "${OUTPUT_ROOT}/sonic_spatial_goal_8xa100/checkpoints/steps_10000"
+    "${OUTPUT_ROOT}/simple_spatial_goal_8xa100/checkpoints/steps_10000"
 ```
 
-SIMPLE 续训使用 `scripts/train_spatial_goal.sh simple`、SIMPLE 数据路径、对应 run 名称和累积步数 `32`。续训沿用原 run 的空间模块参数、历史采样与损失权重；可设置 `CONFIG_YAML="${OUTPUT_ROOT}/${RUN_ID}/config.yaml"` 读取保存的配置。独立 `.pt` 文件用于部署或通过 `trainer.pretrained_checkpoint` 初始化模型权重；完整续训使用上述状态目录。
+SONIC 续训使用 `scripts/train_spatial_goal.sh sonic`、SONIC 数据路径、对应 run 名称和累积步数 `4`。续训沿用原 run 的空间模块参数、历史采样与损失权重；可设置 `CONFIG_YAML="${OUTPUT_ROOT}/${RUN_ID}/config.yaml"` 读取保存的配置。独立 `.pt` 文件用于部署或通过 `trainer.pretrained_checkpoint` 初始化模型权重；完整续训使用上述状态目录。
 
 ## 部署
 
@@ -244,11 +251,11 @@ SIMPLE 续训使用 `scripts/train_spatial_goal.sh simple`、SIMPLE 数据路径
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m deployment.model_server.server_policy \
-  --ckpt_path "${OUTPUT_ROOT}/sonic_spatial_goal_8xa100/checkpoints/steps_40000_pytorch_model.pt" \
+  --ckpt_path "${OUTPUT_ROOT}/simple_spatial_goal_8xa100/checkpoints/steps_40000_pytorch_model.pt" \
   --cuda 0 --use_bf16 --port 10093
 ```
 
-SIMPLE 使用其对应 run 的 checkpoint，命令相同。部署目录保留训练保存的 `config.yaml`、`dataset_statistics.json` 和所选 `.pt` 权重，配置中的 Qwen 与 V-JEPA 路径应可访问；也可使用 `final_model/pytorch_model.pt`。服务按配置构建模型并严格加载权重，新增空间模块需要训练后的参数。
+SONIC 使用其对应 run 的 checkpoint，命令相同。部署目录保留训练保存的 `config.yaml`、`dataset_statistics.json` 和所选 `.pt` 权重，配置中的 Qwen 与 V-JEPA 路径应可访问；也可使用 `final_model/pytorch_model.pt`。服务按配置构建模型并严格加载权重，新增空间模块需要训练后的参数。
 
 客户端发送当前 ego RGB、指令、归一化 state，推荐同时提供观测的 `timestamp`（秒）与 `episode_id`。在线模式每条连接维护一个 episode，batch size 为 1。下面示例展示一次请求；连续控制时复用同一连接，更新图像、state 与观测时间：
 

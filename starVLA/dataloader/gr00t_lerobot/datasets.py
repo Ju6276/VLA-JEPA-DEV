@@ -68,6 +68,25 @@ LE_ROBOT_STEPS_FILENAME = "meta/steps.pkl"
 STEP_INDEX_CACHE_VERSION = 2
 EPSILON = 5e-4
 
+
+def _write_statistics_cache(path: Path, statistics: dict) -> None:
+    """Publish complete statistics without exposing a partial file to other ranks."""
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            json.dump(statistics, stream, indent=4)
+        # The temporary file is closed and on the same filesystem. Readers see
+        # either the previous complete cache or this complete replacement.
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
     """Calculate the dataset statistics of all columns for a list of parquet files."""
     # Dataset statistics
@@ -361,14 +380,13 @@ class LeRobotSingleDataset(Dataset):
                 le_statistics = json.load(f)
             for stat in le_statistics.values():
                 DatasetStatisticalValues.model_validate(stat)
-        except (FileNotFoundError, ValidationError) as e:
+        except (FileNotFoundError, json.JSONDecodeError, ValidationError) as e:
             print(f"Failed to load dataset statistics: {e}")
             print(f"Calculating dataset statistics for {self.dataset_name}")
             # Get all parquet files in the dataset paths
             parquet_files = list((self.dataset_path).glob(LE_ROBOT_DATA_FILENAME))
             le_statistics = calculate_dataset_statistics(parquet_files)
-            with open(stats_path, "w") as f:
-                json.dump(le_statistics, f, indent=4)
+            _write_statistics_cache(stats_path, le_statistics)
         dataset_statistics = {}
         for our_modality in ["state", "action"]:
             dataset_statistics[our_modality] = {}
