@@ -116,6 +116,15 @@ DATA_ROOT=/path/to/sonic_data_root \
 
 默认 run_id 分别为 `g1_pick_between_tables_delta_jepa_8xa100` 和 `sonic_latent_learned_goal`。每个 run 保存配置、`dataset_statistics.json`、`summary.jsonl` 和 `checkpoints/`。
 
+每个保存点包含 `checkpoints/steps_N/` 训练状态目录，以及供部署使用的 `steps_N_pytorch_model.pt`。从训练状态继续：
+
+```bash
+DATA_ROOT=/path/to/sonic_data_root bash scripts/train_sonic_learned_goal.sh \
+  --trainer.resume_from_checkpoint /path/to/run/checkpoints/steps_10000
+```
+
+续训恢复模型、优化器、学习率调度、随机状态、训练步数与数据位置。采样默认保留示范尾段补齐；`datasets.vla_data.require_full_horizon: true` 可选择仅训练动作和未来目标都完整的片段。详细选项见 [训练说明](docs/learned_goals.md)。
+
 训练包含动作学习、未来特征预测、位移预测、逆动力学、动作先验、目标条件动作重建和目标预测七项损失。网络结构、损失权重与 checkpoint 初始化见 [方法说明](docs/learned_goals.md)。
 
 ## 部署
@@ -137,10 +146,10 @@ python -m deployment.model_server.server_policy \
 ```bash
 pip install pytest
 OMP_NUM_THREADS=1 NO_ALBUMENTATIONS_UPDATE=1 \
-  python -m pytest tests/test_learned_goal.py -q
+  python -m pytest tests -q
 ```
 
-测试覆盖训练梯度、未来信息隔离、目标预测与覆盖、候选评分、BF16 输出、权重恢复，以及两套控制接口的维度和时间对齐。
+测试覆盖训练／部署特征对齐、未来信息隔离、动作头混合精度、目标请求协议、采样边界、评估模式、训练状态恢复，以及两套控制接口。
 
 ## 致谢
 

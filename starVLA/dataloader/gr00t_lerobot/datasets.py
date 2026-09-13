@@ -26,6 +26,8 @@ See `scripts/load_dataset.py` for examples on how to use these datasets.
 
 import hashlib
 import json
+import os
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Sequence
@@ -124,6 +126,7 @@ class LeRobotSingleDataset(Dataset):
         video_backend_kwargs: dict | None = None,
         transforms: ComposedModalityTransform | None = None,
         delete_pause_frame: bool = False,
+        require_full_horizon: bool = False,
     ):
         """
         Initialize the dataset.
@@ -136,12 +139,14 @@ class LeRobotSingleDataset(Dataset):
             video_backend_kwargs (dict): Keyword arguments for the video backend when initializing the video reader.
             transforms (ComposedModalityTransform): The transforms to apply to the dataset.
             embodiment_tag (EmbodimentTag): Overload the embodiment tag for the dataset. e.g. define it as "new_embodiment"
+            require_full_horizon (bool): Only sample starts with all configured action/video offsets in the episode. Defaults to the original padding behavior.
         """
         # first check if the path directory exists
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
 
         self.delete_pause_frame = delete_pause_frame
+        self.require_full_horizon = require_full_horizon
 
         self.modality_configs = modality_configs
         self.video_backend = video_backend
@@ -412,6 +417,10 @@ class LeRobotSingleDataset(Dataset):
         Returns:
             list[tuple[str, int]]: A list of (trajectory_id, base_index) tuples.
         """
+        if self.require_full_horizon:
+            return self._get_full_horizon_steps()
+
+        # Keep the existing indices and padding policy for legacy configurations.
         # Create a hash key based on configuration to ensure cache validity
         config_key = self._get_steps_config_key()
         
@@ -468,15 +477,77 @@ class LeRobotSingleDataset(Dataset):
         
         return all_steps
 
+    def _get_full_horizon_steps(self) -> list[tuple[int, int]]:
+        """Cache complete windows separately from the legacy padded sample indices."""
+        config_key = self._get_steps_config_key()
+        steps_path = self.dataset_path / "meta" / f"steps_full_horizon_{config_key}.pkl"
+        all_steps = None
+        try:
+            with steps_path.open("rb") as f:
+                cached_data = pickle.load(f)
+            if cached_data["config_key"] == config_key:
+                all_steps = cached_data["steps"]
+        except (OSError, EOFError, pickle.PickleError, KeyError, TypeError):
+            pass
+
+        if all_steps is None:
+            all_steps = self._get_all_steps_single_process()
+            cache_data = {"config_key": config_key, "steps": all_steps}
+            temporary_path = None
+            try:
+                steps_path.parent.mkdir(parents=True, exist_ok=True)
+                # Multiple distributed ranks may build this cache simultaneously.
+                with tempfile.NamedTemporaryFile(dir=steps_path.parent, delete=False) as f:
+                    temporary_path = Path(f.name)
+                    pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                os.replace(temporary_path, steps_path)
+            except OSError as e:
+                print(f"Could not cache full-horizon steps in {steps_path}: {e}")
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+
+        if not all_steps:
+            raise ValueError(
+                f"Dataset {self.dataset_name} has no valid samples with require_full_horizon=True. "
+                "Check episode lengths, action/video offsets, and delete_pause_frame."
+            )
+        return all_steps
+
     def _get_steps_config_key(self) -> str:
         """Generate a configuration key for steps caching."""
         config_dict = {
             "delete_pause_frame": self.delete_pause_frame,
             "dataset_name": self.dataset_name,
         }
+        if self.require_full_horizon:
+            config_dict.update({
+                "full_horizon_version": 1,
+                "require_full_horizon": True,
+                "delta_indices": {
+                    key: offsets.tolist() for key, offsets in sorted(self.delta_indices.items())
+                },
+                "trajectories": list(zip(
+                    self.trajectory_ids.tolist(), self.trajectory_lengths.tolist()
+                )),
+            })
         # Create a hash of the configuration
         config_str = str(sorted(config_dict.items()))
         return hashlib.md5(config_str.encode()).hexdigest()[:12]  #
+
+    def _valid_step_range(self, trajectory_length: int) -> range:
+        """Bounds include every requested action/video offset, including history."""
+        if not self.require_full_horizon:
+            return range(trajectory_length)
+        offsets = [
+            int(offset)
+            for modality in ("action", "video")
+            for key in self.modality_keys.get(modality, [])
+            for offset in self.delta_indices[key]
+        ]
+        first = max(0, -min(offsets, default=0))
+        stop = min(trajectory_length, trajectory_length - max(offsets, default=0))
+        return range(first, max(first, stop))
 
 
     def _get_all_steps_single_process(self) -> list[tuple[int, int]]:
@@ -493,6 +564,13 @@ class LeRobotSingleDataset(Dataset):
                 data = self.get_trajectory_data(trajectory_id)
             except Exception as e:
                 print(f"Skipping trajectory {trajectory_id} due to data loading error: {e}")
+                skipped_trajectories += 1
+                continue
+            if self.require_full_horizon:
+                # Timestamp and action rows must exist, even if episode metadata is stale.
+                trajectory_length = min(trajectory_length, len(data))
+            valid_starts = self._valid_step_range(trajectory_length)
+            if not valid_starts:
                 skipped_trajectories += 1
                 continue
             trajectory_skipped = False
@@ -521,7 +599,7 @@ class LeRobotSingleDataset(Dataset):
                 # Get position and gripper fields based on available columns
                 delta_position_values, gripper_values = self._get_position_and_gripper_values(data)
                 previous_gripper = gripper_values[0]
-                for base_index in range(trajectory_length):
+                for base_index in valid_starts:
                     if base_index >= len(delta_position_values) or base_index >= len(gripper_values):
                         break
                         
@@ -532,7 +610,7 @@ class LeRobotSingleDataset(Dataset):
                     if has_translation_change or has_gripper_change:
                         all_steps.append((trajectory_id, base_index))
             else:
-                for base_index in range(trajectory_length):
+                for base_index in valid_starts:
                     all_steps.append((trajectory_id, base_index))
                     
         # Print summary statistics
@@ -1534,11 +1612,24 @@ class LeRobotMixtureDataset(Dataset):
             dataset_descriptions.append(dataset_description)
         return json.dumps({"Mixture dataset": dataset_descriptions}, indent=2)
 
+    @property
+    def epoch(self) -> int:
+        """The sampling epoch, shared with persistent DataLoader workers."""
+        return int(self._shared_epoch.item())
+
+    @epoch.setter
+    def epoch(self, epoch: int) -> None:
+        if not hasattr(self, "_shared_epoch"):
+            # Shared CPU storage also survives DataLoader's spawn pickling. Create
+            # it before workers start, through the constructor's set_epoch call.
+            self._shared_epoch = torch.zeros((), dtype=torch.int64).share_memory_()
+        self._shared_epoch.fill_(int(epoch))
+
     def set_epoch(self, epoch: int):
         """Set the epoch for the dataset.
 
         Args:
-            epoch (int): The epoch to set.
+            epoch (int): The epoch to set before creating the next loader iterator.
         """
         self.epoch = epoch
         # self.sampled_steps = self.sample_epoch()
@@ -2139,6 +2230,4 @@ class LeRobotMixtureDataset(Dataset):
                 dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
         
         print(f"Applied cached statistics for {len(self.merged_metadata)} embodiment tags.")
-
-
 

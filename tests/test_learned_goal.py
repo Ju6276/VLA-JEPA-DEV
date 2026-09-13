@@ -95,7 +95,7 @@ def make_model(monkeypatch):
     monkeypatch.setattr(framework, "VisionTransformerPredictorAC", TinyWorldPredictor)
     monkeypatch.setattr(framework.VLA_JEPA, "expand_tokenizer", lambda *a, **kw: (["<action>"], [1], 2))
 
-    def build(learned=True, action_dim=3, state_dim=2, horizon=4):
+    def build(learned=True, action_dim=3, state_dim=2, horizon=4, proposal=True):
         cfg = OmegaConf.create({
             "framework": {
                 "action_model": {
@@ -109,7 +109,7 @@ def make_model(monkeypatch):
                 },
                 "delta_jepa": {
                     "enabled": True, "use_verifier": True, "hidden_dim": 16,
-                    "goal_action_proposal_enabled": True, "subgoals_path": None,
+                    "goal_action_proposal_enabled": proposal, "subgoals_path": None,
                 },
             },
             "datasets": {"vla_data": {"image_size": [8, 8], "CoT_prompt": "{instruction}"}},
@@ -194,6 +194,78 @@ def test_training_backward_and_current_only_world_model(make_model, examples):
     torch.testing.assert_close(training_input, model.vj_predictor.inputs[-1])
 
 
+@pytest.mark.parametrize("learned", [True, False])
+def test_all_goal_heads_share_the_deployed_current_latent(make_model, examples, learned):
+    model = make_model(learned=learned).eval()
+    original_encode = model.vj_encoder.get_vision_features
+
+    def temporal_encode(pixel_values_videos):
+        tokens = original_encode(pixel_values_videos).clone()
+        block_size = tokens.shape[1] // model.num_temporal_frames
+        for block in range(model.num_temporal_frames):
+            tokens[:, block * block_size:(block + 1) * block_size, block] += 2 * (block + 1)
+        return tokens
+
+    model.vj_encoder.get_vision_features = temporal_encode
+    goal_inputs, proposal_inputs, inverse_inputs = [], [], []
+    hooks = [
+        model.goal_action_proposal.register_forward_pre_hook(
+            lambda _, args: proposal_inputs.append(args[0].detach().clone())),
+        model.inv_dyn_decoder.register_forward_pre_hook(
+            lambda _, args: inverse_inputs.append(args[0].detach().clone())),
+    ]
+    if model.goal_predictor is not None:
+        hooks.append(model.goal_predictor.register_forward_pre_hook(
+            lambda _, args: goal_inputs.append(args[0].detach().clone())))
+    model(examples)
+    model.predict_action(
+        **inference_inputs(examples), num_candidates=1,
+        subgoal_images=None if learned else [sample["image"][0] for sample in examples],
+    )
+    for hook in hooks:
+        hook.remove()
+
+    current, target = model._encode_training_goal_pair(
+        [sample["image"] for sample in examples], np.stack([sample["video"] for sample in examples]),
+    )
+    expected_current = model._current_visual_latent(current)
+    for actual in goal_inputs + proposal_inputs:
+        torch.testing.assert_close(actual, expected_current)
+    from starVLA.model.modules.world_model.delta_jepa import pool_vjepa_tokens
+    if learned:
+        torch.testing.assert_close(inverse_inputs[0], pool_vjepa_tokens(target) - expected_current)
+
+
+def test_frozen_encoder_stays_in_eval_and_out_of_optimizer(make_model):
+    from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
+
+    model = make_model().train()
+    assert not model.vj_encoder.training
+    assert model.goal_predictor.training
+    assert all(not p.requires_grad for p in model.vj_encoder.parameters())
+    model.config.trainer.learning_rate = {"base": 1e-4, "vj_encoder": 1e-5}
+    optimizer_params = {
+        id(param) for group in build_param_lr_groups(model, model.config) for param in group["params"]
+    }
+    assert optimizer_params.isdisjoint(id(p) for p in model.vj_encoder.parameters())
+    assert {id(p) for p in model.goal_predictor.parameters()} <= optimizer_params
+
+
+def test_action_repeat_configuration_is_honored(make_model, examples):
+    model = make_model()
+    del model.config.trainer.repeated_diffusion_steps
+    # Legacy checkpoints stored an unused action-model value. Preserve their
+    # effective default, and let the trainer option explicitly control repeats.
+    model.config.framework.action_model.repeated_diffusion_steps = 8
+    batches = []
+    hook = model.action_model.register_forward_pre_hook(lambda _, args: batches.append(args[1].shape[0]))
+    model(examples)
+    model.config.trainer.repeated_diffusion_steps = 2
+    model(examples)
+    hook.remove()
+    assert batches == [len(examples) * 4, len(examples) * 2]
+
+
 @pytest.mark.parametrize("num_candidates", [1, 3])
 def test_deployment_without_external_goal(make_model, examples, num_candidates):
     model = make_model().eval()
@@ -259,6 +331,44 @@ def test_real_world_predictor_endpoint_training(make_model, examples):
     assert np.isfinite(result["verification_scores"]).all()
 
 
+@pytest.mark.parametrize("head_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("verify", [False, True])
+def test_real_action_head_precision_and_export(make_model, examples, monkeypatch, head_dtype, verify):
+    from starVLA.model.modules.action_model.GR00T_ActionHeader import DiTConfig, FlowmatchingActionHead
+
+    monkeypatch.setitem(DiTConfig, "DiT-test", {
+        "input_embedding_dim": 32, "attention_head_dim": 8, "num_attention_heads": 4,
+    })
+    action_cfg = OmegaConf.load(ROOT / "scripts/config/vlajepa_sonic_latent_learned_goal.yaml")
+    action_cfg.framework.action_model.update({
+        "action_model_type": "DiT-test", "hidden_size": 32,
+        "state_dim": 2, "action_dim": 3, "action_horizon": 4,
+        "future_action_window_size": 3, "num_target_vision_tokens": 2,
+        "num_inference_timesteps": 2,
+    })
+    action_cfg.framework.action_model.diffusion_model_cfg.update({
+        "cross_attention_dim": 8, "output_dim": 32, "num_layers": 2,
+    })
+    model = make_model().eval()
+    model.qwen_vl_interface.to(torch.bfloat16)
+    model.action_model = FlowmatchingActionHead(action_cfg).to(head_dtype).eval()
+    output = model.predict_action(**inference_inputs(examples), use_verifier=verify, num_candidates=3)
+    assert output["normalized_actions"].shape == (2, 4, 3)
+    assert output["normalized_actions"].dtype == np.float32
+    assert np.isfinite(output["normalized_actions"]).all()
+    if verify:
+        assert output["all_candidates"].shape == (2, 3, 4, 3)
+        assert np.isfinite(output["verification_scores"]).all()
+
+    # Exercise the real flow head's training boundary and preserve gradients
+    # into a differently typed language backbone.
+    task = torch.randn(2, 2, 8, dtype=torch.bfloat16, requires_grad=True)
+    loss = model.action_model(task, torch.randn(2, 4, 3), torch.randn(2, 1, 2))
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert task.grad is not None and torch.isfinite(task.grad).all() and task.grad.abs().sum() > 0
+
+
 def test_legacy_configuration_and_weights(make_model, examples):
     legacy = make_model(learned=False)
     assert legacy.goal_predictor is None
@@ -272,6 +382,20 @@ def test_legacy_configuration_and_weights(make_model, examples):
         subgoal_images=[sample["image"][0] for sample in examples],
     )
     assert result["goal_source"] == "images"
+
+
+def test_original_prior_checkpoint_and_candidate_path(make_model, examples):
+    original = make_model(learned=False, proposal=False).eval()
+    restored = make_model(learned=False, proposal=False).eval()
+    restored.load_state_dict(original.state_dict(), strict=True)
+    assert restored.goal_predictor is None and restored.goal_action_proposal is None
+    result = restored.predict_action(
+        **inference_inputs(examples), num_candidates=3,
+        subgoal_images=[sample["image"][0] for sample in examples],
+    )
+    assert not result["goal_proposal_used"]
+    assert result["all_candidates"].shape == (2, 3, 4, 3)
+    assert np.isfinite(result["verification_scores"]).all()
 
 
 def test_learned_goal_checkpoint_roundtrip(make_model, examples, tmp_path):

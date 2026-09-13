@@ -18,6 +18,7 @@ def make_LeRobotSingleDataset(
     action_horizon: int = 7,
     video_horizon: int = 16,
     video_frame_offsets: Sequence[int] | None = None,
+    require_full_horizon: bool = False,
 ) -> LeRobotSingleDataset:
     """
     Make a LeRobotSingleDataset object.
@@ -56,6 +57,7 @@ def make_LeRobotSingleDataset(
         video_backend="decord",
         video_backend_kwargs={"num_threads": 1},
         delete_pause_frame=delete_pause_frame,
+        require_full_horizon=require_full_horizon,
     )
 
 def get_vla_dataset(
@@ -93,7 +95,8 @@ def get_vla_dataset(
                                                           delete_pause_frame=delete_pause_frame, 
                                                           action_horizon=action_horizon,
                                                           video_horizon=video_horizon,
-                                                          video_frame_offsets=data_cfg.get("video_frame_offsets", None)), d_weight))
+                                                          video_frame_offsets=data_cfg.get("video_frame_offsets", None),
+                                                          require_full_horizon=data_cfg.get("require_full_horizon", False)), d_weight))
 
     return LeRobotMixtureDataset(
         dataset_mixture,

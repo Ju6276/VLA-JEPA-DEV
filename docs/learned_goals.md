@@ -33,7 +33,11 @@ Qwen 条件 tokens 由当前图像与指令计算。目标预测器输出的是�
 | SIMPLE | 30 | `[0, 4, 8, 12, 16, 20, 24, 30]` |
 | SONIC | 40 | `[0, 6, 12, 18, 24, 30, 35, 40]` |
 
-动作标签覆盖 `[t, t+H)`，目标图像取 t+H。偏移由 `datasets.vla_data.video_frame_offsets` 配置；序列从 0 开始严格递增，长度与 `framework.vj2_model.num_frames` 一致。临近示范末端时按数据集边界补齐规则取样。
+完整片段的动作标签覆盖 `[t, t+H)`，目标图像取 t+H。偏移由 `datasets.vla_data.video_frame_offsets` 配置；序列从 0 开始严格递增，长度与 `framework.vj2_model.num_frames` 一致。
+
+默认 `datasets.vla_data.require_full_horizon: false` 保留尾段补齐规则：越界动作使用原始零值后归一化，越界图像重复末帧，补齐动作参与训练损失。此时临近末端的目标图像时刻为 `min(t+H, episode_length-1)`。设置为 `true` 时，仅采样所有动作／视频偏移均有效的片段；这会减少尾段样本。两种选择使用独立索引缓存，修改跨度后完整片段索引自动更新。
+
+目标预测器和 proposal 的当前 latent 均来自独立当前观察编码的最后时间块；learned-goal 的逆动力学基准与部署评分使用同一个定义。
 
 ## 动作候选
 
@@ -57,7 +61,9 @@ Qwen 条件 tokens 由当前图像与指令计算。目标预测器输出的是�
 | `goal_proposal_loss` | 目标条件动作 chunk 重建 MSE | 0.01 |
 | `goal_prediction_loss` | 预测目标与真实目标的 cosine 距离 | 0.05 |
 
-框架返回的损失值已乘以上述权重。V-JEPA 编码器保持冻结，目标预测器、动作模块、世界模型与 Qwen 按训练配置优化。
+框架返回的损失值已乘以上述权重。V-JEPA 编码器显式冻结、保持 eval 模式并排除在优化器之外；目标预测器、动作模块、世界模型与 Qwen 按训练配置优化。
+
+动作学习的噪声重复次数由 `trainer.repeated_diffusion_steps` 控制，默认4。训练期间的 MAE/MSE 是当前训练 batch 的动作误差诊断：暂时关闭 dropout、跨进程聚合后恢复训练模式。MSE 按逐元素平方误差的均值计算。
 
 ## GRU 动作先验
 
@@ -124,3 +130,16 @@ bash scripts/train_sonic_learned_goal.sh \
 ```
 
 两个命令均使用主 README 中的 `DATA_ROOT`、`VJEPA21_CKPT` 与 `QWEN_MODEL` 环境变量。
+
+## 恢复训练
+
+`trainer.pretrained_checkpoint` 用于从权重开始新训练；`trainer.resume_from_checkpoint` 指定训练状态目录，用于继续同一次训练：
+
+```bash
+bash scripts/train_sonic_learned_goal.sh \
+  --trainer.resume_from_checkpoint /path/to/run/checkpoints/steps_10000
+```
+
+保存点 `steps_N/` 包含 Accelerate/DeepSpeed 模型与优化器状态、学习率调度器、各进程随机状态、训练步数和 epoch／batch 位置；同级 `steps_N_pytorch_model.pt` 用于部署。`trainer_state.json` 在所有状态保存完成后写入。
+
+恢复时保持相同的数据、每进程 batch、进程数与梯度累积设置。数据集 epoch 会传递到持续运行的 worker，恢复后从对应 batch 位置继续。worker 内的数据增强和预取随机状态不序列化，因此随机预处理不保证逐位重放。旧的单独 `.pt` 文件继续用于权重初始化和部署。

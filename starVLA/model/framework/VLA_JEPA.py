@@ -108,6 +108,9 @@ class VLA_JEPA(baseframework):
             self.vj_encoder = AutoModel.from_pretrained(base_encoder)
             self.vj_processor = AutoVideoProcessor.from_pretrained(base_encoder)
 
+        self.vj_encoder.requires_grad_(False)
+        self.vj_encoder.eval()
+
         tubelet_size = self.vj_encoder.config.tubelet_size
         self.num_video_views = self.config.framework.vj2_model.get("num_video_views", 2)
         self.vj_predictor = VisionTransformerPredictorAC(
@@ -225,6 +228,17 @@ class VLA_JEPA(baseframework):
         if self.subgoals_path:
             self.load_subgoal_tracker(self.subgoals_path, precompute_latents=False)
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # JEPA supplies fixed observation/target features in both phases.
+        self.vj_encoder.eval()
+        return self
+
+    def _current_visual_latent(self, video_embeddings: torch.Tensor) -> torch.Tensor:
+        """Use the final block of the complete observation encoding everywhere."""
+        tokens_per_frame = video_embeddings.shape[1] // self.num_temporal_frames
+        return pool_last_temporal_frame(video_embeddings, tokens_per_frame)
+
     def _encode_subgoal_batch(self, goal_images: List[Image.Image]) -> torch.Tensor:
         """Encode a list of subgoal images into pooled latents [M, D]."""
         goal_embeddings = self._encode_goal_images(goal_images)
@@ -294,9 +308,13 @@ class VLA_JEPA(baseframework):
         actions_target: torch.Tensor,
         state: Optional[torch.Tensor],
         tokens_per_frame: int,
+        current_latent: Optional[torch.Tensor] = None,
     ) -> dict:
         """Delta-JEPA displacement + control-aware inverse dynamics losses."""
-        z_t = pool_last_temporal_frame(input_states, tokens_per_frame)
+        z_t = (
+            current_latent if current_latent is not None
+            else pool_last_temporal_frame(input_states, tokens_per_frame)
+        )
         z_tk = pool_vjepa_tokens(gt_states)
         delta_z_gt = z_tk - z_t
 
@@ -368,8 +386,14 @@ class VLA_JEPA(baseframework):
                 goal_images = resize_images(goal_images, target_size=image_size)
         goal_batch = self._images_to_video_batch([[img] for img in goal_images])
         goal_embeddings = self._encode_video_batch(goal_batch)
-        tokens_per_frame = max(1, goal_embeddings.shape[1] // self.num_temporal_frames)
-        return pool_vjepa_tokens(goal_embeddings[:, -tokens_per_frame:, :])
+        return self._current_visual_latent(goal_embeddings)
+
+    def _encode_current_images(self, batch_images: List[List[Image.Image]]) -> torch.Tensor:
+        """Encode only deployable current images, independent of future labels."""
+        image_size = self.config.datasets.vla_data.get("image_size", None)
+        if image_size:
+            batch_images = resize_images(batch_images, target_size=image_size)
+        return self._encode_video_batch(self._images_to_video_batch(batch_images))
 
     def _encode_training_goal_pair(
         self,
@@ -390,7 +414,7 @@ class VLA_JEPA(baseframework):
         if image_size:
             batch_images = resize_images(batch_images, target_size=image_size)
             target_images = resize_images(target_images, target_size=image_size)
-        current_tokens = self._encode_video_batch(self._images_to_video_batch(batch_images))
+        current_tokens = self._encode_current_images(batch_images)
         target_tokens = self._encode_video_batch(self._images_to_video_batch(target_images))
         tokens_per_frame = target_tokens.shape[1] // self.num_temporal_frames
         return current_tokens, target_tokens[:, -tokens_per_frame:]
@@ -497,7 +521,7 @@ class VLA_JEPA(baseframework):
     ) -> torch.Tensor:
         """Sample multiple action chunks from the flow-matching head."""
         candidates = []
-        with torch.autocast("cuda", dtype=torch.float32):
+        with torch.autocast("cuda", enabled=False):
             for _ in range(num_candidates):
                 candidates.append(self.action_model.predict_action(embodied_action_tokens, state))
         return torch.stack(candidates, dim=1)  # [B, N, T, action_dim]
@@ -634,6 +658,9 @@ class VLA_JEPA(baseframework):
         
             # Step 3: VJ Predictor
             tokens_per_step = video_embeddings.shape[1] // T
+            current_latent = (
+                self._current_visual_latent(video_embeddings) if learned_goal_training else None
+            )
             input_states = video_embeddings[:, :-tokens_per_step, :]
             gt_states = goal_target_tokens if learned_goal_training else video_embeddings[:, tokens_per_step:, :]
 
@@ -668,7 +695,7 @@ class VLA_JEPA(baseframework):
             return {"wm_loss": world_model_loss * wm_weight}
 
         # Step 4: Action Expert Forward and Loss
-        with torch.autocast("cuda", dtype=torch.float32):
+        with torch.autocast("cuda", enabled=False):
             # 标签对齐：取最后 chunk_len 段
             if actions_tensor is None:
                 actions_tensor = torch.tensor(
@@ -676,9 +703,9 @@ class VLA_JEPA(baseframework):
                 )
             actions_target = actions_tensor[:, -(self.future_action_window_size+1):, :]  # (B, chunk_len, action_dim)
 
-            repeated_diffusion_steps = (
-                self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
-            )
+            repeated_diffusion_steps = int(self.config.trainer.get("repeated_diffusion_steps", 4))
+            if repeated_diffusion_steps < 1:
+                raise ValueError("repeated_diffusion_steps must be positive")
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             embodied_action_repeated = embodied_action_tokens.repeat(repeated_diffusion_steps, 1, 1)
             
@@ -706,6 +733,7 @@ class VLA_JEPA(baseframework):
                 actions_target=actions_target,
                 state=state_tensor,
                 tokens_per_frame=tokens_per_step,
+                current_latent=current_latent,
             )
             output["delta_loss"] = delta_losses["delta_loss"] * self.lambda_delta
             output["ctrl_loss"] = delta_losses["ctrl_loss"] * self.lambda_ctrl
@@ -714,9 +742,9 @@ class VLA_JEPA(baseframework):
                 * self.lambda_action_prior
             )
             if self.goal_action_proposal is not None or self.goal_predictor is not None:
-                proposal_z_current = pool_last_temporal_frame(
-                    input_states,
-                    tokens_per_step,
+                proposal_z_current = (
+                    current_latent if current_latent is not None
+                    else self._current_visual_latent(self._encode_current_images(batch_images))
                 )
                 proposal_z_goal = pool_vjepa_tokens(gt_states)
                 predicted_goal = None
@@ -801,10 +829,10 @@ class VLA_JEPA(baseframework):
 
         state = torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype) if state is not None else None
         # Step 4: Action Expert Forward and Loss
-        with torch.autocast("cuda", dtype=torch.float32):
+        with torch.autocast("cuda", enabled=False):
             pred_actions = self.action_model.predict_action(embodied_action_tokens, state)  # (B, chunk_len, action_dim)
 
-        normalized_actions = pred_actions.detach().cpu().numpy()
+        normalized_actions = pred_actions.detach().float().cpu().numpy()
         return {"normalized_actions": normalized_actions, "embodied_action_tokens": embodied_action_tokens.to(dtype=torch.float32).detach().cpu().numpy()}
 
     @torch.inference_mode()
@@ -836,7 +864,7 @@ class VLA_JEPA(baseframework):
         video_batch = self._images_to_video_batch(batch_images)
         video_embeddings = self._encode_video_batch(video_batch)
         tokens_per_frame = max(1, video_embeddings.shape[1] // self.num_temporal_frames)
-        z_current = pool_last_temporal_frame(video_embeddings, tokens_per_frame)
+        z_current = self._current_visual_latent(video_embeddings)
 
         action_tokens, embodied_action_tokens = self._get_vlm_action_tokens(
             batch_images=batch_images,

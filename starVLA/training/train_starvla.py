@@ -43,6 +43,14 @@ from starVLA.training.trainer_utils.trainer_tools import normalize_dotlist_args
 from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
+from starVLA.training.trainer_utils.runtime import (
+    TrainingProgress,
+    action_error_metrics,
+    data_iterator_at_progress,
+    load_training_checkpoint,
+    resolve_resume_path,
+    save_training_checkpoint,
+)
 
 deepspeed_plugin = DeepSpeedPlugin()
 accelerator = Accelerator(
@@ -145,19 +153,33 @@ class VLATrainer(TrainerUtils):
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
-        self.writer = SummaryWriter(log_dir=os.path.join(cfg.run_root_dir, cfg.run_id, "tensorboard"))  # 保存目录
+        self.writer = (
+            SummaryWriter(log_dir=os.path.join(cfg.run_root_dir, cfg.run_id, "tensorboard"))
+            if accelerator.is_main_process else None
+        )
 
         # training status tracking
-        self.completed_steps = 0
+        self.progress = TrainingProgress()
+        self._last_saved_step = None
         self.total_batch_size = self._calculate_total_batch_size()
+
+    @property
+    def completed_steps(self):
+        return self.progress.completed_steps
+
+    @completed_steps.setter
+    def completed_steps(self, value):
+        self.progress.completed_steps = value
 
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
         set_seed(seed)
 
-        # load pretrained weights
-        if hasattr(self.config.trainer, "pretrained_checkpoint") and self.config.trainer.pretrained_checkpoint:
+        self.resume_path = resolve_resume_path(self.config)
+        # Weight initialization starts a new run. A full resume restores the model
+        # together with optimizer/scheduler state after Accelerate preparation.
+        if not self.resume_path and getattr(self.config.trainer, "pretrained_checkpoint", None):
             pretrained_checkpoint = self.config.trainer.pretrained_checkpoint
             reload_modules = (
                 self.config.trainer.reload_modules if hasattr(self.config.trainer, "reload_modules") else None
@@ -183,6 +205,15 @@ class VLATrainer(TrainerUtils):
             self.vla_train_dataloader,
             # self.vlm_train_dataloader
         )
+
+        # This scheduler counts optimizer updates, not workers or microbatches.
+        # Keep the existing raw scheduler and register it exactly once for saving.
+        self.progress.batches_per_epoch = len(self.vla_train_dataloader)
+        self.progress.world_size = self.accelerator.num_processes
+        self.progress.gradient_accumulation_steps = self.accelerator.gradient_accumulation_steps
+        if self.progress.batches_per_epoch == 0:
+            raise ValueError("The training dataloader contains no batches")
+        self.accelerator.register_for_checkpointing(self.lr_scheduler, self.progress)
 
         self._init_wandb()
         self._init_checkpointing()
@@ -211,28 +242,25 @@ class VLATrainer(TrainerUtils):
         self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
-        pretrained_checkpoint = getattr(self.config.trainer, "pretrained_checkpoint", None)
-        is_resume = getattr(self.config.trainer, "is_resume", False)
-
-        # resume training state
-        if pretrained_checkpoint and is_resume:
-            self._load_checkpoint(self.config.resume_from_checkpoint)
+        if self.resume_path:
+            self._load_checkpoint(self.resume_path)
 
     def _load_checkpoint(self, checkpoint_path):
         """load checkpoint"""
-        self.accelerator.load_state(checkpoint_path)
-        self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
+        load_training_checkpoint(self.accelerator, self.progress, checkpoint_path)
+        self.accelerator.print(
+            f"Resumed step {self.completed_steps} from {checkpoint_path}; "
+            f"data epoch {self.progress.data_epoch}, batch {self.progress.batches_in_epoch}. "
+            "Worker augmentation/prefetch RNG is not replayed."
+        )
 
     def _save_checkpoint(self):
         """save current training state"""
 
-        if accelerator.is_main_process:
-
-            checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
-            # save model state
-            state_dict = self.accelerator.get_state_dict(self.model)
-            torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
-
+        checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
+        save_training_checkpoint(self.accelerator, self.model, self.progress, checkpoint_path)
+        self._last_saved_step = self.completed_steps
+        if self.accelerator.is_main_process:
             # save training metadata
             summary_data = {
                 "steps": self.completed_steps,
@@ -240,17 +268,18 @@ class VLATrainer(TrainerUtils):
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
             self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
-        accelerator.wait_for_everyone()
 
     def _log_metrics(self, metrics):
         """record training metrics"""
         if self.completed_steps % self.config.trainer.logging_frequency == 0:
-            if dist.get_rank() == 0:
+            if self.accelerator.is_main_process:
                 # add learning rate
                 metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
 
                 # add epoch info
-                metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
+                metrics["epoch"] = round(
+                    self.progress.data_epoch + self.progress.batches_in_epoch / len(self.vla_train_dataloader), 2
+                )
 
                 # record to W&B
                 wandb.log(metrics, step=self.completed_steps)
@@ -259,21 +288,18 @@ class VLATrainer(TrainerUtils):
 
     def _create_data_iterators(self):
         """create data iterators"""
-        self.vla_iter = iter(self.vla_train_dataloader)
-        # self.vlm_iter = iter(self.vlm_train_dataloader)
+        self.vla_iter = data_iterator_at_progress(self.accelerator, self.vla_train_dataloader, self.progress)
 
     def _get_next_batch(self):
         """get next batch (automatically handle data loop)"""
         try:
             batch_vla = next(self.vla_iter)
         except StopIteration:
-            if not hasattr(self, "vla_epoch_count"):
-                self.vla_epoch_count = 0
-            self.vla_iter, self.vla_epoch_count = TrainerUtils._reset_dataloader(
-                self.vla_train_dataloader, self.vla_epoch_count
-            )
+            self.progress.data_epoch += 1
+            self.progress.batches_in_epoch = 0
+            self._create_data_iterators()
             batch_vla = next(self.vla_iter)
-
+        self.progress.batches_in_epoch += 1
         return batch_vla
 
     import torch
@@ -343,10 +369,10 @@ class VLATrainer(TrainerUtils):
 
         # create progress bar
         progress_bar = tqdm(
-            range(self.config.trainer.max_train_steps), disable=not self.accelerator.is_local_main_process
+            total=self.config.trainer.max_train_steps,
+            initial=self.completed_steps,
+            disable=not self.accelerator.is_local_main_process,
         )
-
-        i = 0
 
         # main training loop
         while self.completed_steps < self.config.trainer.max_train_steps:
@@ -361,29 +387,10 @@ class VLATrainer(TrainerUtils):
             t_end_model = time.perf_counter()
 
             # update progress
-            if self.accelerator.sync_gradients:
+            did_update = self.accelerator.sync_gradients and not self.accelerator.optimizer_step_was_skipped
+            if did_update:
                 progress_bar.update(1)
                 self.completed_steps += 1
-            
-            """
-            i += 1
-            print(i, self.completed_steps)
-            if i == 2:
-                self.initial_state_dict = {
-                    k: v.detach().clone()
-                    for k, v in self.model.state_dict().items()
-                }
-            elif i == 3:
-                comparison_state_dict = self.model.state_dict()
-                print(self.compare_state_dict(self.initial_state_dict, comparison_state_dict))
-            elif i == 4:
-                comparison_state_dict = self.model.state_dict()
-                print(self.compare_state_dict(self.initial_state_dict, comparison_state_dict))
-            elif i == 5:
-                comparison_state_dict = self.model.state_dict()
-                print(self.compare_state_dict(self.initial_state_dict, comparison_state_dict))
-                exit()
-            """
             
             if self.accelerator.is_local_main_process:
                 progress_bar.set_postfix(
@@ -394,16 +401,17 @@ class VLATrainer(TrainerUtils):
                     )
 
             # evaluate model
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
-                step_metrics = self.eval_action_model(step_metrics)
+            if did_update and self.completed_steps % self.config.trainer.eval_interval == 0:
+                step_metrics = self.eval_action_model(step_metrics, examples=batch_vla)
 
             # record metrics
             step_metrics["data_time"] = t_end_data - t_start_data
             step_metrics["model_time"] = t_end_model - t_start_model
-            self._log_metrics(step_metrics)
+            if did_update:
+                self._log_metrics(step_metrics)
 
             # save checkpoint
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+            if did_update and self.completed_steps % self.config.trainer.save_interval == 0:
                 self._save_checkpoint()
 
             # check termination condition
@@ -411,57 +419,22 @@ class VLATrainer(TrainerUtils):
                 break
 
         # training end processing
+        progress_bar.close()
         self._finalize_training()
 
         # execute evaluation step
 
-    def eval_action_model(self, step_metrics: dict = None) -> float:
+    def eval_action_model(self, step_metrics: dict = None, *, examples) -> dict:
+        """Action error diagnostic on the current training batch on every rank.
+
+        Reusing this batch avoids advancing only rank zero's training iterator.
+        This is a training diagnostic, not a held-out success-rate evaluation.
         """
-        Evaluate the model on the given dataset using the specified metric function.
-
-        :param eval_dataset: List of evaluation samples, each containing 'image', 'instruction', and 'action'.
-        :param metric_fn: Function to compute the distance between predicted and ground truth actions.
-        :return: Average metric score across the evaluation dataset.
-        """
-
-        if self.accelerator.is_main_process:
-
-            examples = self._get_next_batch()
-
-            score = 0.0
-            num_samples = len(examples)
-
-            batch_images = [example["image"] for example in examples]
-            instructions = [example["lang"] for example in examples]  # [B, str]
-            actions = [example["action"] for example in examples]  # label
-            state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
-
-
-            # Predict actions using the model
-            output_dict = self.model.predict_action(
-                batch_images=batch_images, 
-                instructions=instructions, 
-                state=state,
-                use_ddim=True,
-                num_ddim_steps=20
-            )
-
-            normalized_actions = output_dict["normalized_actions"]  # B, T, D
-            mae_score = np.mean(np.abs(normalized_actions - actions))
-
-            actions = np.array(actions)  # convert actions to numpy.ndarray
-            # B, Chunk, dim = actions.shape
-            num_pots = np.prod(actions.shape)
-            # Compute the metric score
-            score = TrainerUtils.euclidean_distance(normalized_actions, actions)
-            average_score = score / num_pots
-            step_metrics["mse_score"] = average_score
-            step_metrics["mae_score"] = mae_score
-            self.writer.add_scalar("mae_score", step_metrics["mae_score"], self.completed_steps)
-            self.writer.add_scalar("mse_score", step_metrics["mse_score"], self.completed_steps)
-        
-        pass
-        dist.barrier()  # ensure all processes are synchronized
+        step_metrics = {} if step_metrics is None else step_metrics
+        step_metrics.update(action_error_metrics(self.accelerator, self.model, examples))
+        if self.writer is not None:
+            for name in ("mae_score", "mse_score"):
+                self.writer.add_scalar(name, step_metrics[name], self.completed_steps)
         return step_metrics
 
     def _log_training_config(self):
@@ -476,7 +449,6 @@ class VLATrainer(TrainerUtils):
     def _train_step(self, batch_vla, batch_vlm=None):
         """execute single training step"""
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
             # VLA task forward propagation
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
@@ -487,12 +459,14 @@ class VLATrainer(TrainerUtils):
             self.accelerator.backward(total_loss)
 
             # gradient clipping
-            if self.config.trainer.gradient_clipping is not None:
+            if self.accelerator.sync_gradients and self.config.trainer.gradient_clipping is not None:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
             # optimizer step
             self.optimizer.step()
-            self.lr_scheduler.step()
+            if self.accelerator.sync_gradients and not self.accelerator.optimizer_step_was_skipped:
+                self.lr_scheduler.step()
+            self.optimizer.zero_grad()
             
             result_dict = {k: v.item() for k, v in output_dict.items()}
 
@@ -500,17 +474,20 @@ class VLATrainer(TrainerUtils):
 
     def _finalize_training(self):
         """training end processing"""
+        if self._last_saved_step != self.completed_steps:
+            self._save_checkpoint()
         # save final model
+        state_dict = self.accelerator.get_state_dict(self.model)
         if self.accelerator.is_main_process:
             final_checkpoint = os.path.join(self.config.output_dir, "final_model")
             os.makedirs(final_checkpoint, exist_ok=True)
-            state_dict = self.accelerator.get_state_dict(self.model)
             torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
         # close W&B
         if self.accelerator.is_main_process:
             wandb.finish()
+            self.writer.close()
 
         self.accelerator.wait_for_everyone()
 

@@ -266,12 +266,22 @@ class FlowmatchingActionHead(nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
+    def _prepare_conditioning(self, vl_embs, state):
+        """Match incoming Qwen features to this head's parameter placement."""
+        param = next(self.parameters())
+        vl_embs = vl_embs.to(device=param.device, dtype=param.dtype)
+        if state is not None:
+            state = state.to(device=param.device, dtype=param.dtype)
+        return vl_embs, state
+
 
     def forward(self, vl_embs: torch.Tensor, actions: torch.Tensor, state: torch.Tensor = None):
         """
         vl_embs: shape (B, seq_length, feature_dim)
         actions: shape (B, future_action_window_size, D_action)
         """
+        vl_embs, state = self._prepare_conditioning(vl_embs, state)
+        actions = actions.to(device=vl_embs.device, dtype=vl_embs.dtype)
         device = vl_embs.device
 
         # Embed noised action trajectory.
@@ -319,6 +329,7 @@ class FlowmatchingActionHead(nn.Module):
     @torch.no_grad()
     def predict_action(self, vl_embs: torch.Tensor, state: torch.Tensor = None) -> torch.Tensor:
         # Set initial actions as the sampled noise.
+        vl_embs, state = self._prepare_conditioning(vl_embs, state)
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
         actions = torch.randn(

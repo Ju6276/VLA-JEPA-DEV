@@ -126,8 +126,13 @@ class WebsocketPolicyServer:
                     "error": {"message": "Payload must be a dict", "payload_type": str(type(payload))}
                 }
             try:
-                payload["batch_images"] = image_tools.to_pil_preserve(payload["batch_images"])
-                ouput_dict = self._policy.predict_action(**payload)
+                # Decode both observation and optional goal images without replacing
+                # the caller's arrays or modifying the request's nested containers.
+                policy_payload = dict(payload)
+                policy_payload["batch_images"] = image_tools.to_pil_preserve(payload["batch_images"])
+                if payload.get("subgoal_images") is not None:
+                    policy_payload["subgoal_images"] = image_tools.to_pil_preserve(payload["subgoal_images"])
+                output_dict = self._policy.predict_action(**policy_payload)
             except Exception as e:
                 logging.exception("Policy inference error (request_id=%s)", req_id)
                 logging.exception(e)
@@ -142,7 +147,7 @@ class WebsocketPolicyServer:
                         # "traceback": traceback.format_exc(),
                     },
                 }
-            data = ouput_dict
+            data = output_dict
             return {
                 "status": "ok",
                 "ok": True,
