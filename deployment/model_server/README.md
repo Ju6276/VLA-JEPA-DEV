@@ -1,4 +1,4 @@
-# G1 推理服务
+# JEPA Learned Goal 推理服务
 
 [返回主 README](../../README.md) · [控制接口](../../docs/control_interfaces.md)
 

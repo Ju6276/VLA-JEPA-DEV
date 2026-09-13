@@ -1,6 +1,6 @@
 # 8×A100 训练指南
 
-[主 README](README.md) · [方法](docs/learned_goals.md) · [控制接口](docs/control_interfaces.md)
+[主 README](README.md)
 
 ## 1. 环境与数据
 
