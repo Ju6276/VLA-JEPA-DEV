@@ -46,6 +46,7 @@ from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
 from starVLA.training.trainer_utils.runtime import (
     TrainingProgress,
     action_error_metrics,
+    configure_training_accelerator,
     data_iterator_at_progress,
     load_training_checkpoint,
     resolve_resume_path,
@@ -94,6 +95,9 @@ def setup_directories(cfg) -> Path:
 
 def build_model(cfg) -> torch.nn.Module:
     """build model framework"""
+    # New goal/action/world-model heads must use the configured initialization
+    # seed. Per-rank training RNG is initialized later in prepare_training().
+    set_seed(cfg.get("seed", 3047))
     logger.info(f"Loading Base VLM `{cfg.framework.qwenvl.base_vlm}` from ID/Path")
     model = build_framework(cfg)
 
@@ -153,6 +157,7 @@ class VLATrainer(TrainerUtils):
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
+        configure_training_accelerator(self.accelerator, cfg.trainer)
         self.writer = (
             SummaryWriter(log_dir=os.path.join(cfg.run_root_dir, cfg.run_id, "tensorboard"))
             if accelerator.is_main_process else None
@@ -498,7 +503,7 @@ def main(cfg) -> None:
     # create output directory and save config
     output_dir = setup_directories(cfg=cfg)
     # build model
-    vla = build_framework(cfg)
+    vla = build_model(cfg)
     # prepare data
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
 

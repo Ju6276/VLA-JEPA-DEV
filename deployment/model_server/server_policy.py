@@ -11,8 +11,16 @@ import torch, os
 
 
 def main(args) -> None:
+    load_options = {}
+    if args.subgoals_path is not None:
+        # Apply before construction: the checkpoint may refer to a goal path
+        # that no longer exists on the deployment machine.
+        load_options["config_overrides"] = {
+            "framework.delta_jepa.subgoals_path": args.subgoals_path,
+        }
     vla = baseframework.from_pretrained(
         args.ckpt_path,
+        **load_options,
     )
 
     device = torch.device(f"cuda:{str(args.cuda)}")

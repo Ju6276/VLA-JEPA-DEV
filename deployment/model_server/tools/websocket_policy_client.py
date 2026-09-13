@@ -81,11 +81,17 @@ class WebsocketClientPolicy:
         return msgpack_numpy.unpackb(response)
 
     @override
-    def reset(self, instruction) -> None:
-        payload = {"instruction": instruction, "reset": True}
-        self._ws.send(self._packer.pack(payload))
-        resp = self._ws.recv()
-        pass
+    def reset(self, instruction=None) -> Dict:
+        """Reset this connection's subgoal tracker and surface server failures."""
+        request = {"type": "reset", "payload": {"instruction": instruction}}
+        self._ws.send(self._packer.pack(request))
+        response = self._ws.recv()
+        if isinstance(response, str):
+            raise RuntimeError(f"Error in reset server:\n{response}")
+        response = msgpack_numpy.unpackb(response)
+        if not isinstance(response, dict) or not response.get("ok"):
+            raise RuntimeError(f"Policy reset failed: {response}")
+        return response
 
     def close(self) -> None:
         try:

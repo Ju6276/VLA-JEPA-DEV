@@ -94,4 +94,4 @@ SIMPLE 输出为 `[30,36]`，SONIC 输出为 `[40,78]`。执行前使用对应 c
 
 默认请求只需当前图像、指令和 state，subgoal latent 由模型预测。目标图片对照实验可在 payload 中增加可选字段 `subgoal_images: [uint8_RGB_image]`；每个 batch 样本对应一张目标图。服务统一转换当前图像与目标图像，显式目标优先于 tracker 与自动预测目标。省略该字段或传入 `None` 均使用默认目标来源。
 
-示范 tracker 可由服务参数 `--subgoals_path /path/to/subgoals` 加载。切换任务时发送 `{"type":"reset","request_id":"reset-001"}` 重置 tracker。
+示范 tracker 可由服务参数 `--subgoals_path /path/to/subgoals` 加载，此参数会在模型构建前覆盖 checkpoint 中保存的路径。tracker 每个连接独立维护一条轨迹，仅支持 batch size 1；批量推理可使用自动目标或逐样本 `subgoal_images`。切换任务时发送 `{"type":"reset","request_id":"reset-001"}`，或调用 `client.reset()`，只重置当前连接的 tracker。新连接从第一个目标开始。

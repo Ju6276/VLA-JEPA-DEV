@@ -3,9 +3,11 @@
 # Implemented by [Jinhui YE / HKUST University] in [2025].
 
 import asyncio
+import copy
 import logging
 import traceback
 
+import numpy as np
 import websockets.asyncio.server
 import websockets.frames
 
@@ -48,13 +50,27 @@ class WebsocketPolicyServer:
     async def _handler(self, websocket: websockets.asyncio.server.ServerConnection):
         logging.info(f"Connection from {websocket.remote_address} opened")
         packer = msgpack_numpy.Packer()
+        # Progress belongs to one client trajectory. Images and precomputed
+        # latents are read-only and can be shared without copying model weights.
+        session_tracker = copy.copy(getattr(self._policy, "subgoal_tracker", None))
+        if session_tracker is not None:
+            session_tracker.reset()
 
         await websocket.send(packer.pack(self._metadata))
 
         while True:
             try:
                 msg = msgpack_numpy.unpackb(await websocket.recv())
-                ret = self._route_message(msg)  # route message
+                previous_tracker = getattr(self._policy, "subgoal_tracker", None)
+                if session_tracker is not None:
+                    self._policy.subgoal_tracker = session_tracker
+                try:
+                    # The router is synchronous: no other handler can run while
+                    # this connection's tracker is attached to the shared model.
+                    ret = self._route_message(msg)
+                finally:
+                    if session_tracker is not None:
+                        self._policy.subgoal_tracker = previous_tracker
                 await websocket.send(packer.pack(ret))
             except websockets.ConnectionClosed:
                 logging.info(f"Connection from {websocket.remote_address} closed")
@@ -84,6 +100,17 @@ class WebsocketPolicyServer:
             }
         - Does NOT raise inside this function: all exceptions are caught and encoded in response.
         """
+        if not isinstance(msg, dict):
+            return {
+                "status": "error",
+                "ok": False,
+                "type": "unknown",
+                "request_id": "default",
+                "error": {
+                    "message": "Message must be a dict",
+                    "message_type": type(msg).__name__,
+                },
+            }
         req_id = msg.get("request_id", "default")
         mtype = msg.get("type", "infer")          # default = infer
         payload = msg.get("payload", msg)         # when no explicit payload, treat top-level as payload
@@ -126,6 +153,8 @@ class WebsocketPolicyServer:
                     "error": {"message": "Payload must be a dict", "payload_type": str(type(payload))}
                 }
             try:
+                if payload.get("state") is not None and not np.isfinite(np.asarray(payload["state"])).all():
+                    raise ValueError("state must contain only finite values")
                 # Decode both observation and optional goal images without replacing
                 # the caller's arrays or modifying the request's nested containers.
                 policy_payload = dict(payload)
@@ -133,6 +162,10 @@ class WebsocketPolicyServer:
                 if payload.get("subgoal_images") is not None:
                     policy_payload["subgoal_images"] = image_tools.to_pil_preserve(payload["subgoal_images"])
                 output_dict = self._policy.predict_action(**policy_payload)
+                if "normalized_actions" in output_dict and not np.isfinite(
+                    np.asarray(output_dict["normalized_actions"])
+                ).all():
+                    raise ValueError("Policy returned non-finite normalized_actions")
             except Exception as e:
                 logging.exception("Policy inference error (request_id=%s)", req_id)
                 logging.exception(e)

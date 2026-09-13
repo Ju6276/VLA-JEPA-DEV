@@ -1,11 +1,15 @@
 """CPU runtime regressions using real Accelerate state and small torch models."""
 
 from copy import deepcopy
+import ast
 import os
+from pathlib import Path
 import random
 import socket
+from types import SimpleNamespace
 
-from accelerate import Accelerator
+from accelerate import Accelerator, DeepSpeedPlugin
+from accelerate.utils import set_seed
 import numpy as np
 from omegaconf import OmegaConf
 import pytest
@@ -18,6 +22,7 @@ from torch.utils.data import DataLoader, DistributedSampler, TensorDataset
 from starVLA.training.trainer_utils.runtime import (
     TrainingProgress,
     action_error_metrics,
+    configure_training_accelerator,
     data_iterator_at_progress,
     evaluating,
     load_training_checkpoint,
@@ -212,3 +217,144 @@ def test_two_rank_checkpoint_roundtrip(tmp_path):
     except PermissionError:
         pytest.skip("Local sockets are blocked by the sandbox; Gloo requires loopback networking")
     mp.spawn(_distributed_resume_worker, args=(str(tmp_path),), nprocs=2, join=True)
+
+
+def _trainer_function(name, namespace, *, class_name=None):
+    """Run a production function without importing the CUDA entrypoint globals."""
+    path = Path(__file__).resolve().parents[1] / "starVLA/training/train_starvla.py"
+    tree = ast.parse(path.read_text())
+    body = tree.body
+    if class_name:
+        body = next(node.body for node in body if isinstance(node, ast.ClassDef) and node.name == class_name)
+    function = next(node for node in body if isinstance(node, ast.FunctionDef) and node.name == name)
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace[name]
+
+
+def test_model_initialization_is_controlled_by_configured_seed():
+    config = OmegaConf.create({"seed": 3047, "framework": {"qwenvl": {"base_vlm": "tiny"}}})
+    build = _trainer_function("build_model", {
+        "torch": torch,
+        "set_seed": set_seed,
+        "logger": SimpleNamespace(info=lambda *args: None),
+        "build_framework": lambda config: nn.Sequential(nn.Linear(2, 3), nn.Linear(3, 1)),
+    })
+    torch.manual_seed(7)
+    first = build(config).state_dict()
+    torch.manual_seed(8)
+    second = build(config).state_dict()
+    assert all(torch.equal(first[key], second[key]) for key in first)
+    config.seed += 1
+    third = build(config).state_dict()
+    assert any(not torch.equal(first[key], third[key]) for key in first)
+
+
+def test_configure_actual_accelerate_and_deepspeed_accumulation_and_clipping():
+    accelerator = Accelerator(cpu=True)
+    ds_config = Path(__file__).resolve().parents[1] / "starVLA/config/deepseeds/ds_config.yaml"
+    plugin = DeepSpeedPlugin(hf_ds_config=str(ds_config))
+    config = OmegaConf.create({"gradient_accumulation_steps": 2, "gradient_clipping": 0.5})
+    configure_training_accelerator(accelerator, config, deepspeed_plugin=plugin)
+    assert accelerator.gradient_accumulation_steps == 2
+    assert not accelerator.gradient_state.sync_with_dataloader
+    assert accelerator.gradient_state.plugin_kwargs["sync_each_batch"]
+    # These are the actual config processing operations used by Accelerate.prepare.
+    plugin.fill_match("gradient_accumulation_steps", must_match=False,
+                      gradient_accumulation_steps=accelerator.gradient_accumulation_steps)
+    plugin.deepspeed_config_process(
+        must_match=False, gradient_clipping=1.0,
+        train_micro_batch_size_per_gpu=1, train_batch_size=2,
+    )
+    assert plugin.deepspeed_config["gradient_accumulation_steps"] == 2
+    assert plugin.deepspeed_config["gradient_clipping"] == 0.5
+    config.gradient_clipping = None
+    configure_training_accelerator(accelerator, config, deepspeed_plugin=plugin)
+    assert plugin.deepspeed_config["gradient_clipping"] == 0.0
+
+
+@pytest.mark.parametrize("values", [
+    {"gradient_accumulation_steps": 0},
+    {"gradient_accumulation_steps": 1.5},
+    {"gradient_clipping": -1},
+    {"gradient_clipping": float("nan")},
+])
+def test_invalid_accumulation_or_clipping_is_rejected(values):
+    with pytest.raises(ValueError, match="trainer\\."):
+        configure_training_accelerator(Accelerator(cpu=True), OmegaConf.create(values))
+
+
+def test_accumulated_updates_cross_epoch_and_resume_without_scheduler_drift(tmp_path):
+    class LossModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(1, 1, bias=False)
+            nn.init.zeros_(self.linear.weight)
+
+        def forward(self, batch):
+            return {"loss": (self.linear(batch[0]) - 1).square().mean()}
+
+    accelerator = Accelerator(cpu=True)
+    trainer_config = OmegaConf.create({"gradient_accumulation_steps": 2, "gradient_clipping": None})
+    configure_training_accelerator(accelerator, trainer_config)
+    model = LossModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
+    loader = DataLoader(TensorDataset(torch.tensor([[1.], [2.], [3.]])), batch_size=1)
+    model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
+    progress = TrainingProgress(batches_per_epoch=len(loader), gradient_accumulation_steps=2)
+    accelerator.register_for_checkpointing(scheduler, progress)
+    trainer = SimpleNamespace(
+        accelerator=accelerator, model=model, optimizer=optimizer, lr_scheduler=scheduler,
+        config=SimpleNamespace(trainer=trainer_config),
+    )
+    train_step = _trainer_function("_train_step", {"torch": torch}, class_name="VLATrainer")
+
+    def run_batches(count):
+        iterator = data_iterator_at_progress(accelerator, loader, progress)
+        updates = []
+        for _ in range(count):
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                progress.data_epoch += 1
+                progress.batches_in_epoch = 0
+                iterator = data_iterator_at_progress(accelerator, loader, progress)
+                batch = next(iterator)
+            progress.batches_in_epoch += 1
+            train_step(trainer, batch)
+            did_update = accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped
+            progress.completed_steps += int(did_update)
+            updates.append(did_update)
+        return updates
+
+    assert run_batches(2) == [False, True]
+    checkpoint = tmp_path / "steps_1"
+    save_training_checkpoint(accelerator, model, progress, checkpoint)
+    assert run_batches(4) == [False, True, False, True]
+    expected_weights = deepcopy(model.state_dict())
+    expected_scheduler = deepcopy(scheduler.state_dict())
+    assert progress.completed_steps == 3 and scheduler.last_epoch == 3
+
+    load_training_checkpoint(accelerator, progress, checkpoint)
+    assert run_batches(4) == [False, True, False, True]
+    assert scheduler.state_dict() == expected_scheduler
+    assert progress.completed_steps == 3
+    for key, value in expected_weights.items():
+        assert torch.equal(model.state_dict()[key], value)
+
+    reference = LossModel()
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
+    reference_scheduler = torch.optim.lr_scheduler.StepLR(reference_optimizer, step_size=1, gamma=0.9)
+    for pair in ([1., 2.], [3., 1.], [2., 3.]):
+        reference_optimizer.zero_grad()
+        reference((torch.tensor(pair).reshape(2, 1),))["loss"].backward()
+        reference_optimizer.step()
+        reference_scheduler.step()
+    assert torch.allclose(model.linear.weight, reference.linear.weight, atol=1e-7)
+
+
+def test_invalid_learning_rate_module_path_does_not_silently_use_base_rate():
+    from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
+    config = OmegaConf.create({"trainer": {"learning_rate": {"base": 1e-4, "misspelled_head": 1e-3}}})
+    with pytest.raises(ValueError, match="misspelled_head"):
+        build_param_lr_groups(nn.Linear(2, 2), config)

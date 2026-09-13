@@ -114,7 +114,8 @@ class VisionTransformerPredictorAC(nn.Module):
             grid_height = self.img_height // self.patch_size
             grid_width = self.img_width // self.patch_size
             attn_mask = build_action_block_causal_attention_mask(
-                grid_depth, grid_height, grid_width, add_tokens=num_add_tokens
+                grid_depth, grid_height, grid_width,
+                add_tokens=num_add_tokens + int(self.use_extrinsics),
             )
         self.attn_mask = attn_mask
 
@@ -159,7 +160,10 @@ class VisionTransformerPredictorAC(nn.Module):
         else:
             x = torch.cat([a, x], dim=2).flatten(1, 2)  # [B, T*(H*W+2), D]
 
-        attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
+        attn_mask = (
+            self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
+            if self.attn_mask is not None else None
+        )
 
         # Fwd prop
         for i, blk in enumerate(self.predictor_blocks):

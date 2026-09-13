@@ -361,7 +361,14 @@ class VLA_JEPA(baseframework):
         ):
             video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
             if num_views > 1:
-                video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=num_views, dim=0), dim=2)
+                # Flattening above orders samples as b0v0, b0v1, ..., b1v0.
+                # Restore that layout before concatenating each sample's views.
+                _, num_tokens, embed_dim = video_embeddings.shape
+                video_embeddings = (
+                    video_embeddings.reshape(bsz, num_views, num_tokens, embed_dim)
+                    .permute(0, 2, 1, 3)
+                    .reshape(bsz, num_tokens, num_views * embed_dim)
+                )
         return video_embeddings
 
     def _images_to_video_batch(
@@ -430,8 +437,13 @@ class VLA_JEPA(baseframework):
         if subgoal_images is not None:
             return self._encode_goal_images(subgoal_images), "images"
         if self.subgoal_tracker is not None:
+            if z_current.shape[0] != 1:
+                raise ValueError(
+                    "External subgoal trackers require batch size 1 for a single trajectory; "
+                    "use learned goals or per-sample subgoal_images for batched inference"
+                )
             self.subgoal_tracker.maybe_precompute_latents(self._encode_subgoal_batch)
-            self.subgoal_tracker.update(z_current[0] if z_current.shape[0] == 1 else z_current)
+            self.subgoal_tracker.update(z_current[0])
             images = self.subgoal_tracker.current_subgoal_images(z_current.shape[0])
             return self._encode_goal_images(images), "tracker"
         if self.goal_predictor is not None:
@@ -644,16 +656,8 @@ class VLA_JEPA(baseframework):
                 video_embeddings, goal_target_tokens = self._encode_training_goal_pair(batch_images, batch_videos)
                 T = self.num_temporal_frames
             else:
-                batch_videos = batch_videos.transpose(0, 1, 2, 5, 3, 4)
-                B, V, T, C, H, W = batch_videos.shape
-                batch_videos = batch_videos.reshape(B * V, T, C, H, W)
-                input_videos = self.vj_processor(
-                    videos=[batch_videos[i] for i in range(B * V)], return_tensors="pt"
-                )["pixel_values_videos"].to(self.vj_encoder.device)
-                with torch.no_grad():
-                    video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
-                    video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=V, dim=0), dim=2)
-                T = T // self.vj_encoder.config.tubelet_size
+                video_embeddings = self._encode_video_batch(batch_videos)
+                T = batch_videos.shape[2] // self.vj_encoder.config.tubelet_size
             #print(video_embeddings.shape) # [B, T//tubelet_size * dim_per_frame, V*embed_dim]
         
             # Step 3: VJ Predictor

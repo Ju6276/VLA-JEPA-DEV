@@ -133,6 +133,8 @@ bash scripts/train_sonic_learned_goal.sh \
 
 两个命令均使用主 README 中的 `DATA_ROOT`、`VJEPA21_CKPT` 与 `QWEN_MODEL` 环境变量。
 
+训练的混合精度模式由 Accelerate 启动配置及其 DeepSpeed 配置指定，默认使用 BF16；梯度累积使用 `trainer.gradient_accumulation_steps`，梯度裁剪使用 `trainer.gradient_clipping`（`null` 表示关闭裁剪）。
+
 ## 恢复训练
 
 `trainer.pretrained_checkpoint` 用于从权重开始新训练；`trainer.resume_from_checkpoint` 指定训练状态目录，用于继续同一次训练：

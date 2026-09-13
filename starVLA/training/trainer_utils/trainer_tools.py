@@ -96,8 +96,8 @@ def build_param_lr_groups(model, cfg):
             if params:  # only add param group if there are trainable parameters
                 param_groups.append({"params": params, "lr": lr, "name": module_name})
                 used_params.update(id(p) for p in params)
-        except AttributeError:
-            ReferenceError(f"⚠️ module path `{module_name}` not found in vla")
+        except AttributeError as error:
+            raise ValueError(f"Learning-rate module path `{module_name}` does not exist in the model") from error
 
     # assign base learning rate to the remaining unused parameters (exclude frozen ones)
     other_params = [

@@ -176,6 +176,18 @@ def test_future_is_only_a_label(make_model, examples):
     assert not current_a.requires_grad and not target_a.requires_grad
 
 
+@pytest.mark.parametrize("num_views", [1, 2, 3])
+def test_video_encoding_does_not_mix_independent_samples(make_model, num_views):
+    model = make_model(learned=False).eval()
+    videos = np.zeros((2, num_views, 4, 8, 8, 3), dtype=np.uint8)
+    for sample in range(2):
+        for view in range(num_views):
+            videos[sample, view, :, :, :, view % 3] = 30 + sample * 90 + view * 20
+    together = model._encode_video_batch(videos)
+    separately = torch.cat([model._encode_video_batch(sample[None]) for sample in videos])
+    torch.testing.assert_close(together, separately)
+
+
 def test_training_backward_and_current_only_world_model(make_model, examples):
     torch.manual_seed(2)
     model = make_model()
@@ -312,6 +324,27 @@ def test_tracker_can_override_learned_goal(make_model, examples):
     result = model.predict_action(**inputs, num_candidates=1)
     assert result["goal_source"] == "tracker"
     assert result["subgoal_index"] is not None
+
+
+@pytest.mark.parametrize("mode", ["sequential", "nearest"])
+def test_tracker_rejects_multiple_trajectories_but_explicit_goals_remain_batched(make_model, examples, mode):
+    from starVLA.tools.subgoal_tracker import SubgoalTracker
+
+    model = make_model().eval()
+    model.subgoal_tracker = SubgoalTracker(
+        subgoal_images=[sample["image"][0] for sample in examples], mode=mode,
+    )
+    with pytest.raises(ValueError, match="External subgoal trackers require batch size 1"):
+        model.predict_action(**inference_inputs(examples), num_candidates=1)
+    assert model.subgoal_tracker.current_index == 0
+    assert model.subgoal_tracker.z_goals is None
+
+    result = model.predict_action(
+        **inference_inputs(examples), num_candidates=1,
+        subgoal_images=[sample["image"][0] for sample in examples],
+    )
+    assert result["goal_source"] == "images"
+    assert result["normalized_actions"].shape == (2, 4, 3)
 
 
 def test_real_world_predictor_endpoint_training(make_model, examples):

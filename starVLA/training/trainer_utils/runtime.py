@@ -3,10 +3,41 @@
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import json
+import math
 from pathlib import Path
 
 import numpy as np
 import torch
+
+
+def configure_training_accelerator(accelerator, trainer_config, *, deepspeed_plugin=None):
+    """Apply trainer settings before prepare() creates the distributed optimizer.
+
+    DeepSpeed performs accumulation and clipping inside engine.backward/step;
+    changing only Accelerate's counters or calling clip_grad_norm_ afterwards
+    cannot configure those operations.
+    """
+    steps = trainer_config.get("gradient_accumulation_steps", 1)
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+        raise ValueError("trainer.gradient_accumulation_steps must be a positive integer")
+    clipping = trainer_config.get("gradient_clipping")
+    if clipping is not None and (
+        isinstance(clipping, bool) or not isinstance(clipping, (int, float))
+        or not math.isfinite(clipping) or clipping < 0
+    ):
+        raise ValueError("trainer.gradient_clipping must be a nonnegative finite number or null")
+    if deepspeed_plugin is None:
+        deepspeed_plugin = getattr(accelerator.state, "deepspeed_plugin", None)
+    accelerator.gradient_accumulation_steps = steps
+    # This is a step-based loop over a continuous stream. Partial epochs must
+    # not reset Accelerate's boundary while DeepSpeed continues accumulating.
+    accelerator.gradient_state.plugin_kwargs["sync_with_dataloader"] = False
+    # ZeRO-2 partitions gradients during every backward pass and rejects no_sync.
+    accelerator.gradient_state.plugin_kwargs["sync_each_batch"] = deepspeed_plugin is not None
+    if deepspeed_plugin is not None:
+        deepspeed_plugin.deepspeed_config["gradient_accumulation_steps"] = steps
+        # DeepSpeed represents disabled clipping as 0, rather than None.
+        deepspeed_plugin.deepspeed_config["gradient_clipping"] = float(clipping or 0)
 
 
 @contextmanager

@@ -46,8 +46,7 @@ fi
 echo "启动自动目标训练: ${CONFIG}"
 echo "  GPU 数: ${NUM_PROCESSES}"
 echo "  单卡 batch: ${PER_DEVICE_BATCH_SIZE}"
-echo "  梯度累积: 1"
-echo "  全局 batch: $((NUM_PROCESSES * PER_DEVICE_BATCH_SIZE))"
+echo "  梯度累积与全局 batch: 以 trainer 配置和训练启动日志为准"
 echo "  输出目录: ${OUTPUT_ROOT}/${RUN_ID}"
 echo "  目标来源: 当前 ego 图像 + 指令 + 状态（无需 SUBGOALS_PATH）"
 

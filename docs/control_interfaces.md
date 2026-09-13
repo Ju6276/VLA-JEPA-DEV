@@ -82,4 +82,13 @@ x = x_normalized * std + mean
 
 常量维度按 [StateActionTransform](../starVLA/dataloader/gr00t_lerobot/transform/state_action.py) 的实现处理。控制客户端应使用数据配置的同一变换与字段顺序。
 
+已加载的模型可直接获取带接口归一化模式的统计并恢复动作：
+
+```python
+action_stats = model.get_action_stats()
+actions = model.unnormalize_actions(result["normalized_actions"], action_stats)
+```
+
+只运行客户端时，可用 `baseframework.get_action_stats(norm_stats=checkpoint_statistics)` 读取保存的统计。SIMPLE 和 SONIC 的统计标签会补充对应的逐维 `normalization_modes`；该字段也可显式提供。反归一化支持 `[H,A]` 和 `[B,H,A]`，保留连续动作通道；min-max 和 mean/std 字段不会统一裁剪到 `[-1,1]`。
+
 服务在连接时发送 `state_dim`、`action_dim` 和 `action_horizon`，用于客户端选择对应的状态处理与动作执行接口。WebSocket 消息格式见 [部署文档](../deployment/model_server/README.md)。
