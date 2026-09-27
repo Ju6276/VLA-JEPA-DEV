@@ -17,6 +17,7 @@ def make_LeRobotSingleDataset(
     delete_pause_frame: bool = False,
     action_horizon: int = 7,
     video_horizon: int = 16,
+    prediction_horizon=None,
 ) -> LeRobotSingleDataset:
     """
     Make a LeRobotSingleDataset object.
@@ -27,6 +28,8 @@ def make_LeRobotSingleDataset(
     :param crop_obs_camera: Whether to crop the observation camera images.
     :return: A LeRobotSingleDataset object.
     """
+    if prediction_horizon is not None and video_horizon != prediction_horizon + 1:
+        raise ValueError("Aligned video_horizon must equal prediction_horizon + 1")
     data_config_cls = ROBOT_TYPE_CONFIG_MAP[robot_type]
     data_config = data_config_cls(
         observation_indices=list(range(video_horizon)),
@@ -40,7 +43,7 @@ def make_LeRobotSingleDataset(
         embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
     else:
         embodiment_tag = ROBOT_TYPE_TO_EMBODIMENT_TAG[robot_type]
-    return LeRobotSingleDataset(
+    dataset = LeRobotSingleDataset(
         dataset_path=dataset_path,
         modality_configs=modality_config,
         transforms=transforms,
@@ -49,6 +52,16 @@ def make_LeRobotSingleDataset(
         video_backend_kwargs={"num_threads": 1},
         delete_pause_frame=delete_pause_frame,
     )
+    if prediction_horizon is not None:
+        # Reject padded endpoints and padded proposal labels at episode ends.
+        lengths = dict(zip(dataset.trajectory_ids, dataset.trajectory_lengths))
+        last_offset = max(prediction_horizon, action_horizon - 1)
+        dataset._all_steps = [(episode, step) for episode, step in dataset.all_steps
+                              if step + last_offset < lengths[episode]]
+        if not dataset._all_steps:
+            raise ValueError(f"No unpadded aligned samples in {data_name}")
+    return dataset
+
 
 def get_vla_dataset(
     data_cfg: dict,
@@ -59,6 +72,7 @@ def get_vla_dataset(
     delete_pause_frame: bool = True,
     action_horizon: int = 7,
     video_horizon: int = 16,
+    prediction_horizon=None,
     **kwargs: dict,
 ) -> LeRobotMixtureDataset:
     """
@@ -84,7 +98,8 @@ def get_vla_dataset(
                                                           robot_type, 
                                                           delete_pause_frame=delete_pause_frame, 
                                                           action_horizon=action_horizon,
-                                                          video_horizon=video_horizon), d_weight))
+                                                          video_horizon=video_horizon,
+                                                          prediction_horizon=prediction_horizon), d_weight))
 
     return LeRobotMixtureDataset(
         dataset_mixture,
@@ -95,6 +110,7 @@ def get_vla_dataset(
         resolution_size=data_cfg.get("resolution_size", 224),
         video_resolution_size=data_cfg.get("video_resolution_size", 256),
         duplicate_single_view=data_cfg.get("duplicate_single_view", True),
+        prediction_horizon=prediction_horizon,
         seed=seed,
         **kwargs,
     )

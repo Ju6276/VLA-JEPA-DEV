@@ -1396,6 +1396,7 @@ class LeRobotMixtureDataset(Dataset):
         video_resolution_size: int = 256,
         duplicate_single_view: bool = True,
         seed: int = 42,
+        prediction_horizon=None,
         metadata_config: dict = {
             "percentile_mixing_method": "min_max",
         },
@@ -1432,6 +1433,7 @@ class LeRobotMixtureDataset(Dataset):
         self.resolution_size = resolution_size
         self.video_resolution_size = video_resolution_size
         self.duplicate_single_view = duplicate_single_view
+        self.prediction_horizon = prediction_horizon
 
         # Set properties for sampling
 
@@ -1613,7 +1615,12 @@ class LeRobotMixtureDataset(Dataset):
                 videos, images = [], []
                 for i, video_key in enumerate(dataset.modality_keys["video"]):
                     video = data[video_key] # Shape: (T, H, W, C)
-                    video = self.resize_video_opencv(video, self.video_resolution_size)
+                    if self.prediction_horizon is not None:
+                        # Match the online PIL path for every independently encoded endpoint.
+                        video = np.stack([np.asarray(Image.fromarray(frame).resize(
+                            (self.resolution_size, self.resolution_size))) for frame in video])
+                    else:
+                        video = self.resize_video_opencv(video, self.video_resolution_size)
                     if len(dataset.modality_keys["video"]) > 2:
                         if i in [0, 2]:
                             videos.append(video)
@@ -1633,6 +1640,12 @@ class LeRobotMixtureDataset(Dataset):
                 action = np.concatenate(action, axis=1).astype(np.float16)
 
                 return_dict = dict(action=action, image=images, lang=language, video=videos)
+                if self.prediction_horizon is not None:
+                    if videos.shape[0] != 1 or videos.shape[1] != self.prediction_horizon + 1:
+                        raise ValueError("Aligned samples require one camera and h+1 actual frames")
+                    return_dict["prediction_horizon"] = self.prediction_horizon
+                    return_dict["alignment"] = {"episode": int(trajectory_name), "start_step": int(step),
+                                                "target_step": int(step + self.prediction_horizon)}
                 if self.with_state:
                     state = []
                     for state_key in dataset.modality_keys["state"]:
@@ -2139,6 +2152,5 @@ class LeRobotMixtureDataset(Dataset):
                 dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
         
         print(f"Applied cached statistics for {len(self.merged_metadata)} embodiment tags.")
-
 
 

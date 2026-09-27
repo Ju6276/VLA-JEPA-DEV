@@ -37,14 +37,27 @@ def save_dataset_statistics(dataset_statistics, run_dir):
 
 def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here only is get dataset, we need mv dataloader to here
 
+    if (cfg.framework.get("delta_jepa", {}).get("visual_target_mode") == "aligned_endpoint"
+        and dataset_py != "lerobot_datasets"):
+        raise ValueError("Aligned targets currently require the lerobot_datasets loader")
     if dataset_py == "lerobot_datasets":
         from starVLA.dataloader.lerobot_datasets import get_vla_dataset, collate_fn
         vla_dataset_cfg = cfg.datasets.vla_data
+        delta_cfg = cfg.framework.get("delta_jepa", {})
+        aligned = delta_cfg.get("visual_target_mode", "legacy_shift") == "aligned_endpoint"
+        prediction_horizon = delta_cfg.get("prediction_horizon", None) if aligned else None
+        if aligned:
+            from starVLA.model.modules.world_model.aligned_foresight import validate_horizons
+            validate_horizons(prediction_horizon, delta_cfg.get("executed_prefix"),
+                              int(cfg.framework.action_model.action_horizon))
+            if cfg.framework.vj2_model.get("num_video_views", 2) != 1 or vla_dataset_cfg.get("duplicate_single_view", True):
+                raise ValueError("Aligned mode requires one ego camera and duplicate_single_view=false")
 
         vla_dataset = get_vla_dataset(
             data_cfg=vla_dataset_cfg,
             action_horizon=cfg.framework.action_model.action_horizon,
-            video_horizon=cfg.framework.vj2_model.num_frames,
+            video_horizon=prediction_horizon + 1 if aligned else cfg.framework.vj2_model.num_frames,
+            prediction_horizon=prediction_horizon,
             delete_pause_frame=vla_dataset_cfg.get("delete_pause_frame", False))
         
         num_workers = cfg.datasets.vla_data.get("num_workers", 8)

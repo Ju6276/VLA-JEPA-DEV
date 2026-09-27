@@ -39,6 +39,10 @@ from starVLA.model.modules.world_model.delta_jepa import (
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.tools.subgoal_tracker import SubgoalTracker
+from starVLA.model.modules.world_model.aligned_foresight import (
+    validate_horizons, endpoint_video_pair, EndpointActionEncoder,
+    FactorizedActionPrior, weighted_prior_energy,
+)
 
 @FRAMEWORK_REGISTRY.register("VLA_JEPA")
 class VLA_JEPA(baseframework):
@@ -106,17 +110,34 @@ class VLA_JEPA(baseframework):
             self.vj_encoder = AutoModel.from_pretrained(base_encoder)
             self.vj_processor = AutoVideoProcessor.from_pretrained(base_encoder)
 
+        endpoint_cfg = self.config.framework.get("delta_jepa", {})
+        self.visual_target_mode = endpoint_cfg.get("visual_target_mode", "legacy_shift")
+        if self.visual_target_mode not in ("legacy_shift", "aligned_endpoint"):
+            raise ValueError("Unknown visual_target_mode")
+        self.aligned_endpoint = self.visual_target_mode == "aligned_endpoint"
+        self.prediction_horizon = endpoint_cfg.get("prediction_horizon", None)
+        self.executed_prefix = endpoint_cfg.get("executed_prefix", None)
+        self.normalization_id = endpoint_cfg.get("normalization_id", None)
+        if self.aligned_endpoint:
+            validate_horizons(self.prediction_horizon, self.executed_prefix,
+                              int(self.config.framework.action_model.action_horizon))
+            if not endpoint_cfg.get("enabled", False):
+                raise ValueError("Aligned foresight requires delta_jepa.enabled")
+            if int(self.config.framework.action_model.past_action_window_size) != 0:
+                raise ValueError("Aligned mode requires future chunks starting at the current command")
+            if self.chunk_len != int(self.config.framework.action_model.action_horizon):
+                raise ValueError("action_horizon must equal future_action_window_size + 1")
         tubelet_size = self.vj_encoder.config.tubelet_size
         self.num_video_views = self.config.framework.vj2_model.get("num_video_views", 2)
         self.vj_predictor = VisionTransformerPredictorAC(
-            num_frames=self.config.framework.vj2_model.num_frames//tubelet_size,
+            num_frames=1 if self.aligned_endpoint else self.config.framework.vj2_model.num_frames//tubelet_size,
             img_size=((self.vj_encoder.config.image_size, self.vj_encoder.config.image_size)),
             tubelet_size=1,
             depth=self.config.framework.vj2_model.depth,
             num_heads=self.config.framework.vj2_model.num_heads,
             embed_dim=self.vj_encoder.config.hidden_size * self.num_video_views,
             action_embed_dim=self.qwen_vl_interface.model.config.hidden_size,
-            num_add_tokens=self.config.framework.vj2_model.num_action_tokens_per_timestep,
+            num_add_tokens=self.prediction_horizon if self.aligned_endpoint else self.config.framework.vj2_model.num_action_tokens_per_timestep,
         )
         self.replace_prompt = "".join(
             [each * self.config.framework.vj2_model.num_action_tokens_per_timestep for each in
@@ -137,6 +158,8 @@ class VLA_JEPA(baseframework):
             delta_cfg.get("verifier_action_prior_weight", 0.1)
         )
         self.ctrl_action_step = delta_cfg.get("ctrl_action_step", "first")
+        if self.aligned_endpoint and self.ctrl_action_step != "first":
+            raise ValueError("Aligned reference uses first-command reconstruction")
         self.verifier_num_candidates = int(delta_cfg.get("verifier_num_candidates", 8))
         self.use_verifier_default = bool(delta_cfg.get("use_verifier", False))
         self.subgoal_tracking_mode = delta_cfg.get("subgoal_tracking_mode", "sequential")
@@ -150,6 +173,8 @@ class VLA_JEPA(baseframework):
             * self.config.framework.vj2_model.num_action_tokens_per_timestep,
         )
 
+        if self.aligned_endpoint:
+            self.num_predictor_action_tokens = self.prediction_horizon
         if self.use_delta_jepa:
             vlm_hidden_dim = self.qwen_vl_interface.model.config.hidden_size
             action_dim = self.config.framework.action_model.action_dim
@@ -157,7 +182,8 @@ class VLA_JEPA(baseframework):
             jepa_embed_dim = self.vj_encoder.config.hidden_size * self.num_video_views
             hidden_dim = int(delta_cfg.get("hidden_dim", 512))
 
-            self.candidate_action_encoder = CandidateActionEncoder(
+            candidate_encoder_cls = EndpointActionEncoder if self.aligned_endpoint else CandidateActionEncoder
+            self.candidate_action_encoder = candidate_encoder_cls(
                 action_dim=action_dim,
                 hidden_dim=hidden_dim,
                 output_dim=vlm_hidden_dim,
@@ -169,12 +195,28 @@ class VLA_JEPA(baseframework):
                 action_dim=action_dim,
                 hidden_dim=hidden_dim,
             )
-            self.action_dynamics_prior = ActionDynamicsPrior(
-                action_dim=action_dim,
-                state_dim=state_dim,
-                hidden_dim=hidden_dim,
-                num_layers=int(delta_cfg.get("action_prior_num_layers", 2)),
-            )
+            self.prior_type = delta_cfg.get("prior_type", "joint")
+            self.command_groups = tuple(int(d) for d in delta_cfg.get("command_groups", [action_dim]))
+            if any(d <= 0 for d in self.command_groups) or sum(self.command_groups) != action_dim:
+                raise ValueError("command_groups must partition the action coordinates")
+            self.command_group_weights = tuple(float(w) for w in
+                delta_cfg.get("command_group_weights", self.command_groups))
+            if (len(self.command_group_weights) != len(self.command_groups)
+                or not all(np.isfinite(w) and w >= 0 for w in self.command_group_weights)
+                or sum(self.command_group_weights) <= 0):
+                raise ValueError("Invalid command_group_weights")
+            prior_layers = int(delta_cfg.get("action_prior_num_layers", 2))
+            if self.prior_type == "joint":
+                self.action_dynamics_prior = ActionDynamicsPrior(
+                    action_dim=action_dim, state_dim=state_dim,
+                    hidden_dim=hidden_dim, num_layers=prior_layers)
+            elif self.prior_type == "factorized":
+                if len(self.command_groups) < 2:
+                    raise ValueError("Factorized prior requires at least two command groups")
+                self.action_dynamics_prior = FactorizedActionPrior(
+                    self.command_groups, state_dim, hidden_dim, prior_layers)
+            else:
+                raise ValueError("prior_type must be joint or factorized")
             logger.info(
                 "Delta-JEPA enabled: lambda_wm=%s lambda_delta=%s lambda_ctrl=%s "
                 "lambda_action_prior=%s",
@@ -240,6 +282,12 @@ class VLA_JEPA(baseframework):
             device=action_encoder_param.device,
             dtype=action_encoder_param.dtype,
         )
+        if self.aligned_endpoint:
+            actions_target = actions_target[:, :self.prediction_horizon]
+            candidate_cond = self.candidate_action_encoder(actions_target)
+            # One endpoint block reads every ordered action token. No future
+            # video blocks or action-token interpolation are involved.
+            return candidate_cond + action_tokens.mean(dim=1, keepdim=True) if self.delta_jepa_blend_vlm_tokens else candidate_cond
         candidate_cond = self.candidate_action_encoder(actions_target)
         if candidate_cond.shape[1] != action_tokens.shape[1]:
             candidate_cond = F.interpolate(
@@ -326,9 +374,35 @@ class VLA_JEPA(baseframework):
             videos.append(view_video[None, ...])  # [1, T, H, W, 3]
         return np.stack(videos, axis=0)  # [B, 1, T, H, W, 3]
 
+    def _prepare_observation_images(self, batch_images):
+        """Use the same spatial preprocessing for training, goals, and inference."""
+        data_cfg = self.config.datasets.vla_data
+        if self.aligned_endpoint:
+            size = int(data_cfg.get("resolution_size", 224))
+            batch_images = resize_images(batch_images, target_size=(size, size))
+        train_size = data_cfg.get("image_size", None)
+        if train_size:
+            batch_images = resize_images(batch_images, target_size=tuple(train_size))
+        return batch_images
+
+    def _encode_aligned_training_pair(self, examples, batch_images):
+        """Encode independently observed endpoints, never a joint future clip."""
+        if any(ex.get("prediction_horizon") != self.prediction_horizon for ex in examples):
+            raise ValueError("Dataset must supply the configured prediction_horizon")
+        current = self._encode_video_batch(self._images_to_video_batch(batch_images))
+        target_images = [[Image.fromarray(ex["video"][0, self.prediction_horizon])]
+                         for ex in examples]
+        target_images = self._prepare_observation_images(target_images)
+        target = self._encode_video_batch(self._images_to_video_batch(target_images))
+        tokens_per_frame = current.shape[1] // self.num_temporal_frames
+        return current, target[:, -tokens_per_frame:, :], tokens_per_frame
+
     def _encode_goal_images(self, goal_images: List[Image.Image]) -> torch.Tensor:
         """Encode subgoal images into pooled JEPA latents. Returns [B, D]."""
-        goal_batch = self._images_to_video_batch([[img] for img in goal_images])
+        goal_images = [[img] for img in goal_images]
+        if self.aligned_endpoint:
+            goal_images = self._prepare_observation_images(goal_images)
+        goal_batch = self._images_to_video_batch(goal_images)
         goal_embeddings = self._encode_video_batch(goal_batch)
         tokens_per_frame = max(1, goal_embeddings.shape[1] // self.num_temporal_frames)
         return pool_vjepa_tokens(goal_embeddings[:, -tokens_per_frame:, :])
@@ -339,6 +413,12 @@ class VLA_JEPA(baseframework):
         action_cond: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run predictor and return (input_states, gt_states, predicted_states)."""
+        if self.aligned_endpoint:
+            tokens_per_frame = video_embeddings.shape[1] // self.num_temporal_frames
+            current = video_embeddings[:, -tokens_per_frame:, :]
+            param = next(self.vj_predictor.parameters())
+            predicted = self.vj_predictor(current.to(param), action_cond.to(param))
+            return current, None, predicted
         num_temporal = self.num_temporal_frames
         tokens_per_step = video_embeddings.shape[1] // num_temporal
         input_states = video_embeddings[:, :-tokens_per_step, :]
@@ -457,6 +537,10 @@ class VLA_JEPA(baseframework):
         """
         batch_images = [example["image"] for example in examples]  # [B, [PIL.Image]]
         batch_videos = [example["video"] for example in examples]  #  [B, V, T, H, W, 3]
+        if self.aligned_endpoint:
+            if "state" not in examples[0]:
+                raise ValueError("Aligned training requires the current proprioceptive state")
+            batch_images = self._prepare_observation_images(batch_images)
         instructions = [example["lang"] for example in examples]  # [B, str]
         actions = [example["action"]for example in examples] if "action" in examples[0] else None # label [B， len, 7]
         
@@ -491,6 +575,10 @@ class VLA_JEPA(baseframework):
         
 
         #[print(each.shape, end=";") for each in batch_videos]
+        if self.aligned_endpoint:
+            if self.num_video_views != 1:
+                raise ValueError("Initial aligned endpoint implementation supports one ego camera")
+            endpoint_video_pair(np.stack(batch_videos), self.prediction_horizon, 1)
         batch_videos = np.stack(batch_videos)  #  [B, V, T, H, W, 3]
         batch_videos = batch_videos.transpose(0,1,2,5,3,4)  # [B, V, T, 3, H, W]
 
@@ -531,38 +619,48 @@ class VLA_JEPA(baseframework):
             #print(action_tokens.shape, last_hidden.shape, embodied_action_tokens.shape)
             #exit()
         
-            # Step 2: JEPA Encoder
-            B, V, T, C, H, W = batch_videos.shape
-            batch_videos = batch_videos.reshape(B*V, T, C, H, W)  # [B*V, T, C, H, W]
-            input_videos = self.vj_processor(
-                videos=[batch_videos[i] for i in range(B*V)], return_tensors="pt"
-            )["pixel_values_videos"].to(self.vj_encoder.device)  # [B*V, T, C, H, W]
-            with torch.no_grad():
-                video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
-                video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=V, dim=0), dim=2)
-            #print(video_embeddings.shape) # [B, T//tubelet_size * dim_per_frame, V*embed_dim]
+            if self.aligned_endpoint:
+                if actions is None:
+                    raise ValueError("Endpoint training requires timestamp-aligned robot commands")
+                current_embeddings, gt_states, tokens_per_step = self._encode_aligned_training_pair(examples, batch_images)
+                actions_tensor = torch.as_tensor(np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype)
+                if actions_tensor.shape[1] != self.chunk_len:
+                    raise ValueError("Aligned training expects exactly H current-to-future commands")
+                action_cond = self._build_predictor_action_cond(action_tokens, actions_tensor)
+                input_states, _, predicted_states = self._predict_future_latent(current_embeddings, action_cond)
+            else:
+                # Step 2: JEPA Encoder
+                B, V, T, C, H, W = batch_videos.shape
+                batch_videos = batch_videos.reshape(B*V, T, C, H, W)  # [B*V, T, C, H, W]
+                input_videos = self.vj_processor(
+                    videos=[batch_videos[i] for i in range(B*V)], return_tensors="pt"
+                )["pixel_values_videos"].to(self.vj_encoder.device)  # [B*V, T, C, H, W]
+                with torch.no_grad():
+                    video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
+                    video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=V, dim=0), dim=2)
+                #print(video_embeddings.shape) # [B, T//tubelet_size * dim_per_frame, V*embed_dim]
         
-            # Step 3: VJ Predictor
-            T = T // self.vj_encoder.config.tubelet_size
-            tokens_per_step = video_embeddings.shape[1] // T
-            input_states = video_embeddings[:, :-tokens_per_step, :]
-            gt_states = video_embeddings[:, tokens_per_step:, :]
+                # Step 3: VJ Predictor
+                T = T // self.vj_encoder.config.tubelet_size
+                tokens_per_step = video_embeddings.shape[1] // T
+                input_states = video_embeddings[:, :-tokens_per_step, :]
+                gt_states = video_embeddings[:, tokens_per_step:, :]
 
-            action_cond = action_tokens
-            actions_tensor = None
-            if actions is not None and self.use_delta_jepa:
-                actions_tensor = torch.tensor(
-                    np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
+                action_cond = action_tokens
+                actions_tensor = None
+                if actions is not None and self.use_delta_jepa:
+                    actions_tensor = torch.tensor(
+                        np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
+                    )
+                    actions_target_for_predictor = actions_tensor[
+                        :, -(self.future_action_window_size + 1) :, :
+                    ]
+                    action_cond = self._build_predictor_action_cond(action_tokens, actions_target_for_predictor)
+
+                predicted_states = self.vj_predictor(
+                    input_states,
+                    action_cond
                 )
-                actions_target_for_predictor = actions_tensor[
-                    :, -(self.future_action_window_size + 1) :, :
-                ]
-                action_cond = self._build_predictor_action_cond(action_tokens, actions_target_for_predictor)
-
-            predicted_states = self.vj_predictor(
-                input_states,
-                action_cond
-            )
 
             teacher_forcing_wm_loss = F.l1_loss(
                 predicted_states,
@@ -616,10 +714,11 @@ class VLA_JEPA(baseframework):
             )
             output["delta_loss"] = delta_losses["delta_loss"] * self.lambda_delta
             output["ctrl_loss"] = delta_losses["ctrl_loss"] * self.lambda_ctrl
-            output["action_prior_loss"] = (
-                self.action_dynamics_prior.loss(actions_target, state_tensor)
-                * self.lambda_action_prior
-            )
+            prior_actions = actions_target[:, :self.prediction_horizon] if self.aligned_endpoint else actions_target
+            prior_energy, _ = weighted_prior_energy(
+                self.action_dynamics_prior, prior_actions, state_tensor,
+                self.command_groups, self.command_group_weights)
+            output["action_prior_loss"] = prior_energy.mean() * self.lambda_action_prior
 
         return output
 
@@ -652,9 +751,7 @@ class VLA_JEPA(baseframework):
                 **kwargs,
             )
 
-        train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
-        if train_obs_image_size:
-            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+        batch_images = self._prepare_observation_images(batch_images)
     
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
@@ -705,10 +802,13 @@ class VLA_JEPA(baseframework):
         if not self.use_delta_jepa:
             raise RuntimeError("predict_action_verified requires framework.delta_jepa.enabled=true")
 
-        train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
-        if train_obs_image_size:
-            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+        batch_images = self._prepare_observation_images(batch_images)
 
+        if self.aligned_endpoint:
+            if kwargs.get("executed_prefix") != self.executed_prefix:
+                raise ValueError("Request executed_prefix must match aligned configuration K")
+            if state is None:
+                raise ValueError("Aligned evaluation requires the current state")
         num_candidates = num_candidates or self.verifier_num_candidates
         video_batch = self._images_to_video_batch(batch_images)
         video_embeddings = self._encode_video_batch(video_batch)
@@ -736,15 +836,27 @@ class VLA_JEPA(baseframework):
             else None
         )
 
-        candidates = self.sample_action_candidates(
-            embodied_action_tokens=embodied_action_tokens,
-            state=state_tensor,
-            num_candidates=num_candidates,
-        )
+        supplied_candidates = kwargs.get("candidate_actions", None)
+        if supplied_candidates is None:
+            candidates = self.sample_action_candidates(
+                embodied_action_tokens=embodied_action_tokens,
+                state=state_tensor, num_candidates=num_candidates)
+        else:
+            if not self.normalization_id or kwargs.get("candidate_normalization_id") != self.normalization_id:
+                raise ValueError("Supplied candidates must identify the evaluator's normalization")
+            candidates = torch.as_tensor(supplied_candidates, device=embodied_action_tokens.device,
+                                         dtype=next(self.action_model.parameters()).dtype)
+            expected = (len(batch_images), self.chunk_len, self.config.framework.action_model.action_dim)
+            if candidates.ndim != 4 or (candidates.shape[0], candidates.shape[2], candidates.shape[3]) != expected or candidates.shape[1] < 1 or not torch.isfinite(candidates).all():
+                raise ValueError("candidate_actions must be finite [B,N,H,A] evaluator-normalized commands")
+            num_candidates = candidates.shape[1]
 
         z_goal = self._encode_goal_images(subgoal_images)
 
-        best_scores = torch.full((candidates.shape[0],), -1e9, device=candidates.device)
+        return_candidate_trace = bool(kwargs.get("return_candidate_trace", False))
+        trace_progress, trace_prior, trace_groups = [], [], []
+        trace_selected = torch.zeros(candidates.shape[0], device=candidates.device, dtype=torch.long)
+        best_scores = torch.full((candidates.shape[0],), -torch.inf, device=candidates.device)
         best_actions = candidates[:, 0]
 
         for idx in range(num_candidates):
@@ -753,19 +865,26 @@ class VLA_JEPA(baseframework):
             _, _, predicted_states = self._predict_future_latent(video_embeddings, candidate_cond)
             z_predicted = pool_vjepa_tokens(predicted_states)
             goal_progress = latent_progress_score(z_current, z_predicted, z_goal)
-            action_prior_error = self.action_dynamics_prior.energy(
-                candidate_chunk,
-                state_tensor,
-            )
+            prior_chunk = candidate_chunk[:, :self.prediction_horizon] if self.aligned_endpoint else candidate_chunk
+            action_prior_error, group_errors = weighted_prior_energy(
+                self.action_dynamics_prior, prior_chunk, state_tensor,
+                self.command_groups, self.command_group_weights)
             scores = (
                 goal_progress
                 - self.verifier_action_prior_weight * action_prior_error
             )
+            if not torch.isfinite(scores).all():
+                raise ValueError("Non-finite candidate score")
+            if return_candidate_trace:
+                trace_progress.append(goal_progress)
+                trace_prior.append(action_prior_error)
+                trace_groups.append(group_errors)
+                trace_selected = torch.where(scores > best_scores, idx, trace_selected)
             better = scores > best_scores
             best_scores = torch.where(better, scores, best_scores)
             best_actions = torch.where(better.unsqueeze(-1).unsqueeze(-1), candidate_chunk, best_actions)
 
-        return {
+        result = {
             "normalized_actions": best_actions.detach().cpu().numpy(),
             "verification_scores": best_scores.detach().cpu().numpy(),
             "all_candidates": candidates.detach().cpu().numpy(),
@@ -776,6 +895,27 @@ class VLA_JEPA(baseframework):
                 self.subgoal_tracker.state_dict() if self.subgoal_tracker is not None else None
             ),
         }
+        result["execution_contract"] = {"mode": self.visual_target_mode,
+            "H": self.chunk_len, "h": self.prediction_horizon, "K": self.executed_prefix,
+            "normalization_id": self.normalization_id}
+        if return_candidate_trace:
+            progress = torch.stack(trace_progress, dim=1)
+            prior = torch.stack(trace_prior, dim=1)
+            result["candidate_trace"] = {
+                "schema_version": 2, "goal_progress": progress.float().cpu().numpy(),
+                "prior_energy": prior.float().cpu().numpy(),
+                "prior_group_energy": torch.stack(trace_groups, dim=1).float().cpu().numpy(),
+                "joint_score": (progress - self.verifier_action_prior_weight * prior).float().cpu().numpy(),
+                "selected_index": trace_selected.cpu().numpy(),
+                "beta": self.verifier_action_prior_weight,
+                "command_groups": self.command_groups, "command_group_weights": self.command_group_weights,
+                "prior_type": self.prior_type, "visual_target_mode": self.visual_target_mode,
+                "current_latent": z_current.float().cpu().numpy(), "goal_latent": z_goal.float().cpu().numpy(),
+                "observation_rgb": [np.asarray(sample[0]).copy() for sample in batch_images],
+                "goal_rgb": [np.asarray(img).copy() for img in subgoal_images],
+            }
+        return result
+
 
 
 

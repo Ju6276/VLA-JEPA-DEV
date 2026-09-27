@@ -1,0 +1,18 @@
+# Merge into an existing action-prior training configuration.
+# h and K MUST be set for the actual command rate/execution client.
+framework:
+  vj2_model:
+    num_video_views: 1
+  delta_jepa:
+    enabled: true
+    visual_target_mode: aligned_endpoint
+    prediction_horizon: ???
+    executed_prefix: ???
+    ctrl_action_step: first
+    prior_type: joint
+    command_groups: [64, 14]
+    command_group_weights: [64, 14]
+    use_verifier: true
+datasets:
+  vla_data:
+    duplicate_single_view: false
